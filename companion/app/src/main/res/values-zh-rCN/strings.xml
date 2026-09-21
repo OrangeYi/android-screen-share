@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Android 屏幕共享</string>
+    <string name="channel_name">屏幕共享</string>
+    <string name="channel_description">显示设备是否正在向电脑分享画面</string>
+    <string name="notification_title">已连接电脑</string>
+    <string name="desktop_sharing">桌面显示正在分享</string>
+    <string name="mirror_sharing">手机屏幕正在分享</string>
+    <string name="stop_sharing">停止分享</string>
+</resources>

@@ -1,0 +1,24 @@
+# Downloaded runtime
+tools/scrcpy/
+
+# Local state
+data/
+*.log
+*.user
+
+# Android/Gradle build output
+.gradle/
+**/build/
+local.properties
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Signing material must never be committed
+*.jks
+*.keystore
+*.p12
+*.pem

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Android Screen Share</string>
+    <string name="channel_name">Screen sharing</string>
+    <string name="channel_description">Shows when this device is sharing a display with a computer</string>
+    <string name="notification_title">Connected to computer</string>
+    <string name="desktop_sharing">Desktop display is being shared</string>
+    <string name="mirror_sharing">Phone screen is being shared</string>
+    <string name="stop_sharing">Stop sharing</string>
+</resources>
