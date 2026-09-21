@@ -14,6 +14,10 @@ $script:T = ([IO.File]::ReadAllText($localePath, [Text.Encoding]::UTF8) | Conver
 $script:scrcpyDir = Join-Path $script:root 'tools\scrcpy'
 $script:adbPath = Join-Path $script:scrcpyDir 'adb.exe'
 $script:scrcpyPath = Join-Path $script:scrcpyDir 'scrcpy.exe'
+# scrcpy honors the ADB environment variable before searching PATH/current
+# directory. Override stale or malformed system/user values so that both this
+# app and scrcpy always use the adb.exe downloaded alongside scrcpy.
+$env:ADB = $script:adbPath
 $script:companionApk = Join-Path $script:root 'assets\companion.apk'
 $script:companionPackage = 'dev.androidscreenshare.companion'
 $script:sessions = @{}

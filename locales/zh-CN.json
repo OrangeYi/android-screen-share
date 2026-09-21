@@ -54,5 +54,7 @@
   "setupComplete": "安装完成，已在桌面创建快捷方式。",
   "setupFailed": "安装失败",
   "latestNotFound": "找不到 scrcpy 最新版的 Windows x64 压缩包。",
-  "archiveLayout": "下载的 scrcpy 压缩包结构不符合预期。"
+  "archiveLayout": "下载的 scrcpy 压缩包结构不符合预期。",
+  "scrcpyIncomplete": "scrcpy 安装不完整。请检查 Windows 安全中心的保护历史记录，然后重新运行 Setup.cmd。",
+  "adbCheckFailed": "内置 ADB 无法启动。路径：{0}\r\n\r\n错误：{1}\r\n\r\n请检查 Windows 安全中心是否隔离了 adb.exe；如果系统早于 Windows 10，请升级系统。"
 }
