@@ -342,20 +342,51 @@ function Pair-WirelessAddress {
     }
 }
 
+function Get-DeviceWifiIpv4Address([string]$serial) {
+    # Do not take the first `src` from `ip route`: cellular (rmnet*) and VPN
+    # routes can appear before Wi-Fi. Prefer an address assigned directly to a
+    # Wi-Fi interface, then use progressively broader Android fallbacks.
+    $addressLines = Invoke-Adb $serial @('shell', '--', 'ip', '-o', '-4', 'addr', 'show') -allowFailure
+    foreach ($line in $addressLines) {
+        if ($line -match '^\d+:\s+([^\s:@]+)(?:@[^\s:]+)?\s+.*\binet\s+(\d{1,3}(?:\.\d{1,3}){3})/') {
+            $interfaceName = $Matches[1]
+            $ipAddress = $Matches[2]
+            if ($interfaceName -match '^(?:wlan|swlan|wifi)\d+$') {
+                return $ipAddress
+            }
+        }
+    }
+
+    $routeLines = Invoke-Adb $serial @('shell', '--', 'ip', '-4', 'route') -allowFailure
+    foreach ($line in $routeLines) {
+        if ($line -match '\bdev\s+(?:wlan|swlan|wifi)\d+\b' -and
+            $line -match '\bsrc\s+(\d{1,3}(?:\.\d{1,3}){3})\b') {
+            return $Matches[1]
+        }
+    }
+
+    $wifiStatus = Invoke-Adb $serial @('shell', '--', 'cmd', 'wifi', 'status') -allowFailure
+    foreach ($line in $wifiStatus) {
+        if ($line -match '\bIP(?: Address)?:\s*/?(\d{1,3}(?:\.\d{1,3}){3})\b') {
+            return $Matches[1]
+        }
+    }
+
+    throw (Get-Text 'ipNotDetected')
+}
+
 function Enable-WirelessFromUsb {
     try {
         $serial = Get-SelectedSerial
         if ($serial -match ':') {
             throw (Get-Text 'selectUsb')
         }
-        $route = (Invoke-Adb $serial @('shell', '--', 'ip', 'route') -allowFailure) -join ' '
-        if ($route -notmatch '\bsrc\s+(\d{1,3}(?:\.\d{1,3}){3})\b') {
-            throw (Get-Text 'ipNotDetected')
-        }
-        $address = "$($Matches[1]):5555"
+        $wifiIp = Get-DeviceWifiIpv4Address $serial
+        $address = "${wifiIp}:5555"
+        Add-Log (Get-Text 'wifiAddressDetected' @($wifiIp))
         Invoke-Adb $serial @('tcpip', '5555') | Out-Null
-        Start-Sleep -Milliseconds 900
-        $result = Invoke-Adb '' @('connect', $address) -allowFailure
+        Start-Sleep -Milliseconds 1500
+        $result = Invoke-Adb '' @('connect', $address)
         $script:addressBox.Text = $address
         Add-Log ($result -join ' ')
         Refresh-Devices
