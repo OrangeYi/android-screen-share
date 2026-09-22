@@ -172,6 +172,10 @@ function Get-CursorPlacement {
     return [pscustomobject]@{
         X = $screen.WorkingArea.Left + 24
         Y = $screen.WorkingArea.Top + 24
+        WorkX = $screen.WorkingArea.Left
+        WorkY = $screen.WorkingArea.Top
+        WorkWidth = $screen.WorkingArea.Width
+        WorkHeight = $screen.WorkingArea.Height
     }
 }
 
@@ -226,6 +230,17 @@ function Start-ShareSession {
             $beforeIds = @(Get-VirtualDisplayIds $serial)
         }
 
+        $windowX = if ($mode -eq 'desktop' -and $script:fullscreenCheck.Checked) {
+            $placement.WorkX
+        } else {
+            $placement.X
+        }
+        $windowY = if ($mode -eq 'desktop' -and $script:fullscreenCheck.Checked) {
+            $placement.WorkY
+        } else {
+            $placement.Y
+        }
+
         $scrcpyArguments = @(
             '-s', $serial,
             '--video-codec=h264',
@@ -233,11 +248,18 @@ function Start-ShareSession {
             "--video-bit-rate=$bitrate",
             '--video-buffer=0',
             '--audio-buffer=80',
-            "--window-x=$($placement.X)",
-            "--window-y=$($placement.Y)"
+            "--window-x=$windowX",
+            "--window-y=$windowY"
         )
         if ($script:fullscreenCheck.Checked) {
-            $scrcpyArguments += '--fullscreen'
+            if ($mode -eq 'desktop') {
+                $scrcpyArguments += @(
+                    '--window-borderless',
+                    "--window-width=$($placement.WorkWidth)",
+                    "--window-height=$($placement.WorkHeight)")
+            } else {
+                $scrcpyArguments += '--fullscreen'
+            }
         }
         if ($script:audioCheck.Checked) {
             $scrcpyArguments += @('--audio-source=output', '--audio-codec=aac')
