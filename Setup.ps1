@@ -9,7 +9,8 @@ $localePath = Join-Path $root 'locales\zh-CN.json'
 $text = ([IO.File]::ReadAllText($localePath, [Text.Encoding]::UTF8) | ConvertFrom-Json)
 $toolsDir = Join-Path $root 'tools'
 $scrcpyDir = Join-Path $toolsDir 'scrcpy'
-$launcher = Join-Path $root 'Start-AndroidScreenShare.cmd'
+$launcher = Join-Path $root 'Start-AndroidScreenShare.vbs'
+$wscriptPath = Join-Path $env:SystemRoot 'System32\wscript.exe'
 $requiredScrcpyFiles = @(
     'scrcpy.exe',
     'scrcpy-server',
@@ -32,6 +33,29 @@ function Test-ScrcpyInstall {
         }
     }
     return $true
+}
+
+function Update-DesktopShortcut([switch]$CreateIfMissing) {
+    $desktop = [Environment]::GetFolderPath('Desktop')
+    $shortcutPath = Join-Path $desktop 'Android Screen Share.lnk'
+    $shortcutExists = Test-Path -LiteralPath $shortcutPath -PathType Leaf
+    if (-not $shortcutExists -and -not $CreateIfMissing) { return }
+
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($shortcutPath)
+    if ($shortcutExists -and -not $CreateIfMissing) {
+        $workingDirectory = [string]$shortcut.WorkingDirectory
+        if (-not $workingDirectory) { return }
+        $shortcutRoot = [IO.Path]::GetFullPath($workingDirectory).TrimEnd('\')
+        if ($shortcutRoot -ne $root.TrimEnd('\')) { return }
+    }
+
+    $shortcut.TargetPath = $wscriptPath
+    $shortcut.Arguments = '//nologo "' + $launcher + '"'
+    $shortcut.WorkingDirectory = $root
+    $shortcut.IconLocation = (Join-Path $scrcpyDir 'scrcpy.exe') + ',0'
+    $shortcut.Description = [string]$text.appTitle
+    $shortcut.Save()
 }
 
 try {
@@ -88,19 +112,10 @@ try {
         throw ([string]::Format([string]$text.adbCheckFailed, $adbPath, $detail))
     }
 
+    Update-DesktopShortcut -CreateIfMissing:(-not $Silent)
     if (-not $Silent) {
-        $desktop = [Environment]::GetFolderPath('Desktop')
-        $shortcutPath = Join-Path $desktop 'Android Screen Share.lnk'
-        $shell = New-Object -ComObject WScript.Shell
-        $shortcut = $shell.CreateShortcut($shortcutPath)
-        $shortcut.TargetPath = $launcher
-        $shortcut.WorkingDirectory = $root
-        $shortcut.IconLocation = (Join-Path $scrcpyDir 'scrcpy.exe') + ',0'
-        $shortcut.Description = [string]$text.appTitle
-        $shortcut.Save()
-
         Show-SetupMessage ([string]$text.setupComplete)
-        Start-Process -FilePath $launcher -WorkingDirectory $root
+        Start-Process -FilePath $wscriptPath -ArgumentList @('//nologo', ('"' + $launcher + '"')) -WorkingDirectory $root
     }
 } catch {
     if ($Silent) {

@@ -159,9 +159,34 @@ try {
         throw "Setup validation failed with exit code $($setupProcess.ExitCode)."
     }
 
+    # Refresh an existing desktop shortcut that belongs to this installation.
+    # Do not create or alter unrelated shortcuts (also keeps isolated tests safe).
+    $desktop = [Environment]::GetFolderPath('Desktop')
+    $shortcutPath = Join-Path $desktop 'Android Screen Share.lnk'
+    if (Test-Path -LiteralPath $shortcutPath -PathType Leaf) {
+        $shell = New-Object -ComObject WScript.Shell
+        $shortcut = $shell.CreateShortcut($shortcutPath)
+        $shortcutWorkingDirectory = [string]$shortcut.WorkingDirectory
+        if ($shortcutWorkingDirectory) {
+            $shortcutRoot = [IO.Path]::GetFullPath($shortcutWorkingDirectory).TrimEnd('\')
+        } else {
+            $shortcutRoot = ''
+        }
+        if ($shortcutRoot -and $shortcutRoot -eq $InstallRoot.TrimEnd('\')) {
+            $launcher = Join-Path $InstallRoot 'Start-AndroidScreenShare.vbs'
+            $shortcut.TargetPath = Join-Path $env:SystemRoot 'System32\wscript.exe'
+            $shortcut.Arguments = '//nologo "' + $launcher + '"'
+            $shortcut.WorkingDirectory = $InstallRoot
+            $shortcut.IconLocation = (Join-Path $InstallRoot 'tools\scrcpy\scrcpy.exe') + ',0'
+            $shortcut.Save()
+        }
+    }
+
     Show-UpdateMessage ([string]::Format([string]$text.updateComplete, $archiveVersion))
     if ($Restart) {
-        Start-Process -FilePath (Join-Path $InstallRoot 'Start-AndroidScreenShare.cmd') -WorkingDirectory $InstallRoot
+        $launcher = Join-Path $InstallRoot 'Start-AndroidScreenShare.vbs'
+        Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\wscript.exe') `
+            -ArgumentList @('//nologo', ('"' + $launcher + '"')) -WorkingDirectory $InstallRoot
     }
 } catch {
     Show-UpdateMessage ([string]::Format([string]$text.updateFailed, $_.Exception.Message)) ([string]$text.updateFailedTitle)

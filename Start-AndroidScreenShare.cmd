@@ -1,3 +1,3 @@
 @echo off
 setlocal
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Sta -File "%~dp0app\AndroidScreenShare.ps1"
+wscript.exe //nologo "%~dp0Start-AndroidScreenShare.vbs"
