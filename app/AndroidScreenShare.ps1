@@ -29,6 +29,7 @@ $script:currentVersion = if (Test-Path -LiteralPath $script:versionPath) {
 $script:lastDeviceSerial = ''
 $script:companionApk = Join-Path $script:root 'assets\companion.apk'
 $script:companionPackage = 'dev.androidscreenshare.companion'
+$script:companionVersionCode = 2
 $script:sessions = @{}
 $script:logBox = $null
 $script:deviceCombo = $null
@@ -142,20 +143,39 @@ function Refresh-Devices {
 
 function Ensure-Companion([string]$serial) {
     $installed = Invoke-Adb $serial @('shell', '--', 'pm', 'path', $script:companionPackage) -allowFailure
-    if (-not (($installed -join '') -match '^package:')) {
+    $installedVersionCode = 0
+    if (($installed -join '') -match '^package:') {
+        $packageInfo = Invoke-Adb $serial @(
+            'shell', '--', 'dumpsys', 'package', $script:companionPackage) -allowFailure
+        foreach ($line in $packageInfo) {
+            if ($line -match '\bversionCode=(\d+)') {
+                $installedVersionCode = [int]$Matches[1]
+                break
+            }
+        }
+    }
+    if ($installedVersionCode -lt $script:companionVersionCode) {
         if (-not (Test-Path -LiteralPath $script:companionApk)) {
             throw (Get-Text 'companionMissing')
         }
-        $answer = [System.Windows.Forms.MessageBox]::Show(
-            (Get-Text 'installPrompt'),
-            (Get-Text 'installTitle'),
-            [System.Windows.Forms.MessageBoxButtons]::YesNo,
-            [System.Windows.Forms.MessageBoxIcon]::Question)
-        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
-            throw (Get-Text 'installDeclined')
+        if ($installedVersionCode -eq 0) {
+            $answer = [System.Windows.Forms.MessageBox]::Show(
+                (Get-Text 'installPrompt'),
+                (Get-Text 'installTitle'),
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Question)
+            if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
+                throw (Get-Text 'installDeclined')
+            }
         }
         Add-Log (Get-Text 'installing')
         $result = Invoke-Adb $serial @('install', '-r', $script:companionApk) -allowFailure
+        if (($result -join "`n") -match 'INSTALL_FAILED_UPDATE_INCOMPATIBLE') {
+            # Version 1 used a one-off signing key. The helper stores no user data,
+            # so replace that legacy package once and keep future upgrades seamless.
+            Invoke-Adb $serial @('uninstall', $script:companionPackage) -allowFailure | Out-Null
+            $result = Invoke-Adb $serial @('install', $script:companionApk) -allowFailure
+        }
         if (($result -join "`n") -notmatch 'Success') {
             throw (Get-Text 'installFailed' @(($result -join ' ')))
         }

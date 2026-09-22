@@ -7,4 +7,17 @@
     <string name="desktop_sharing">桌面显示正在分享</string>
     <string name="mirror_sharing">手机屏幕正在分享</string>
     <string name="stop_sharing">停止分享</string>
+    <string name="status_title">屏幕分享状态</string>
+    <string name="status_checking">正在检查电脑连接……</string>
+    <string name="mirror_active">手机屏幕：正在分享</string>
+    <string name="mirror_inactive">手机屏幕：未分享</string>
+    <string name="desktop_active">桌面显示：正在分享</string>
+    <string name="desktop_inactive">桌面显示：未分享</string>
+    <string name="notifications_enabled">常驻通知：已开启</string>
+    <string name="notifications_disabled">常驻通知：已关闭——请进入通知设置开启</string>
+    <string name="no_share_advice">没有检测到电脑端分享通道。如果电脑仍能看到手机画面，请关闭电脑上的 scrcpy 窗口，并关闭 USB 调试或无线调试。</string>
+    <string name="refresh_status">刷新状态</string>
+    <string name="notification_settings">通知设置</string>
+    <string name="stop_mirror">停止手机屏幕分享</string>
+    <string name="stop_desktop">停止桌面分享</string>
 </resources>

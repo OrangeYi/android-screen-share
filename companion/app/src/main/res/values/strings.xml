@@ -7,4 +7,17 @@
     <string name="desktop_sharing">Desktop display is being shared</string>
     <string name="mirror_sharing">Phone screen is being shared</string>
     <string name="stop_sharing">Stop sharing</string>
+    <string name="status_title">Screen sharing status</string>
+    <string name="status_checking">Checking the computer connection…</string>
+    <string name="mirror_active">Phone screen: sharing</string>
+    <string name="mirror_inactive">Phone screen: not sharing</string>
+    <string name="desktop_active">Desktop display: sharing</string>
+    <string name="desktop_inactive">Desktop display: not sharing</string>
+    <string name="notifications_enabled">Persistent notification: enabled</string>
+    <string name="notifications_disabled">Persistent notification: disabled — open notification settings to enable it</string>
+    <string name="no_share_advice">No computer sharing channel was detected. If a computer still shows your screen, close its scrcpy window and disable USB or wireless debugging.</string>
+    <string name="refresh_status">Refresh status</string>
+    <string name="notification_settings">Notification settings</string>
+    <string name="stop_mirror">Stop phone screen sharing</string>
+    <string name="stop_desktop">Stop desktop sharing</string>
 </resources>

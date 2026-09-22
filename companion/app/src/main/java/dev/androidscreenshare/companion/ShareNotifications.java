@@ -40,6 +40,14 @@ final class ShareNotifications {
                 stopIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
+        Intent statusIntent = new Intent(context, StatusActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        PendingIntent statusPendingIntent = PendingIntent.getActivity(
+                context,
+                requestCode + 100,
+                statusIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
         Notification.Action stopAction = new Notification.Action.Builder(
                 android.R.drawable.ic_menu_close_clear_cancel,
                 context.getString(R.string.stop_sharing),
@@ -49,6 +57,7 @@ final class ShareNotifications {
                 .setSmallIcon(R.drawable.ic_screen_share)
                 .setContentTitle(context.getString(R.string.notification_title))
                 .setContentText(context.getString(textResource))
+                .setContentIntent(statusPendingIntent)
                 .setCategory(Notification.CATEGORY_SERVICE)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
