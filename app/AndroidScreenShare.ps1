@@ -142,47 +142,57 @@ function Refresh-Devices {
 }
 
 function Ensure-Companion([string]$serial) {
-    $installed = Invoke-Adb $serial @('shell', '--', 'pm', 'path', $script:companionPackage) -allowFailure
-    $installedVersionCode = 0
-    if (($installed -join '') -match '^package:') {
-        $packageInfo = Invoke-Adb $serial @(
-            'shell', '--', 'dumpsys', 'package', $script:companionPackage) -allowFailure
-        foreach ($line in $packageInfo) {
-            if ($line -match '\bversionCode=(\d+)') {
-                $installedVersionCode = [int]$Matches[1]
-                break
+    try {
+        $installed = Invoke-Adb $serial @('shell', '--', 'pm', 'path', $script:companionPackage) -allowFailure
+        $installedVersionCode = 0
+        if (($installed -join '') -match '^package:') {
+            $packageInfo = Invoke-Adb $serial @(
+                'shell', '--', 'dumpsys', 'package', $script:companionPackage) -allowFailure
+            foreach ($line in $packageInfo) {
+                if ($line -match '\bversionCode=(\d+)') {
+                    $installedVersionCode = [int]$Matches[1]
+                    break
+                }
             }
         }
-    }
-    if ($installedVersionCode -lt $script:companionVersionCode) {
-        if (-not (Test-Path -LiteralPath $script:companionApk)) {
-            throw (Get-Text 'companionMissing')
-        }
-        if ($installedVersionCode -eq 0) {
-            $answer = [System.Windows.Forms.MessageBox]::Show(
-                (Get-Text 'installPrompt'),
-                (Get-Text 'installTitle'),
-                [System.Windows.Forms.MessageBoxButtons]::YesNo,
-                [System.Windows.Forms.MessageBoxIcon]::Question)
-            if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
-                throw (Get-Text 'installDeclined')
+        if ($installedVersionCode -lt $script:companionVersionCode) {
+            if (-not (Test-Path -LiteralPath $script:companionApk)) {
+                Add-Log (Get-Text 'companionUnavailable' @((Get-Text 'companionMissing')))
+                return $false
+            }
+            if ($installedVersionCode -eq 0) {
+                $answer = [System.Windows.Forms.MessageBox]::Show(
+                    (Get-Text 'installPrompt'),
+                    (Get-Text 'installTitle'),
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Question)
+                if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
+                    Add-Log (Get-Text 'companionSkipped')
+                    return $false
+                }
+            }
+            Add-Log (Get-Text 'installing')
+            $result = Invoke-Adb $serial @('install', '-r', $script:companionApk) -allowFailure
+            if (($result -join "`n") -match 'INSTALL_FAILED_UPDATE_INCOMPATIBLE') {
+                # Version 1 used a one-off signing key. The helper stores no user data,
+                # so replace that legacy package once and keep future upgrades seamless.
+                Invoke-Adb $serial @('uninstall', $script:companionPackage) -allowFailure | Out-Null
+                $result = Invoke-Adb $serial @('install', $script:companionApk) -allowFailure
+            }
+            if (($result -join "`n") -notmatch 'Success') {
+                Add-Log (Get-Text 'companionUnavailable' @(
+                    (Get-Text 'installFailed' @(($result -join ' ')))))
+                return $false
             }
         }
-        Add-Log (Get-Text 'installing')
-        $result = Invoke-Adb $serial @('install', '-r', $script:companionApk) -allowFailure
-        if (($result -join "`n") -match 'INSTALL_FAILED_UPDATE_INCOMPATIBLE') {
-            # Version 1 used a one-off signing key. The helper stores no user data,
-            # so replace that legacy package once and keep future upgrades seamless.
-            Invoke-Adb $serial @('uninstall', $script:companionPackage) -allowFailure | Out-Null
-            $result = Invoke-Adb $serial @('install', $script:companionApk) -allowFailure
-        }
-        if (($result -join "`n") -notmatch 'Success') {
-            throw (Get-Text 'installFailed' @(($result -join ' ')))
-        }
+        Invoke-Adb $serial @(
+            'shell', '--', 'pm', 'grant', $script:companionPackage,
+            'android.permission.POST_NOTIFICATIONS') -allowFailure | Out-Null
+        return $true
+    } catch {
+        Add-Log (Get-Text 'companionUnavailable' @($_.Exception.Message))
+        return $false
     }
-    Invoke-Adb $serial @(
-        'shell', '--', 'pm', 'grant', $script:companionPackage,
-        'android.permission.POST_NOTIFICATIONS') -allowFailure | Out-Null
 }
 
 function Get-CursorPlacement {
@@ -203,6 +213,20 @@ function Get-VirtualDisplayIds([string]$serial) {
             $ids += [int]$match.Value
         }
     }
+
+    # Android 12 and some vendor builds do not implement
+    # `cmd display get-displays`. Fall back to dumpsys and select only
+    # virtual displays created by scrcpy, so physical/DeX display ids are not
+    # mistaken for the session we just started.
+    if ($ids.Count -eq 0) {
+        $dump = Invoke-Adb $serial @('shell', '--', 'dumpsys', 'display') -allowFailure
+        $dumpText = $dump -join "`n"
+        foreach ($match in [regex]::Matches(
+            $dumpText,
+            'DisplayInfo\{"scrcpy",\s*displayId\s+(\d+)')) {
+            $ids += [int]$match.Groups[1].Value
+        }
+    }
     return @($ids | Sort-Object -Unique)
 }
 
@@ -214,11 +238,13 @@ function Stop-ShareSession([string]$mode, [bool]$killProcess = $true) {
     if ($killProcess -and -not $session.Process.HasExited) {
         Stop-Process -Id $session.Process.Id -Force -ErrorAction SilentlyContinue
     }
-    try { $session.Listener.Stop() } catch {}
-    Invoke-Adb $session.Serial @(
-        'shell', '--', 'am', 'stopservice', '-n', $session.Component) -allowFailure | Out-Null
-    Invoke-Adb $session.Serial @(
-        'reverse', '--remove', "tcp:$($session.Port)") -allowFailure | Out-Null
+    if ($session.CompanionActive) {
+        try { $session.Listener.Stop() } catch {}
+        Invoke-Adb $session.Serial @(
+            'shell', '--', 'am', 'stopservice', '-n', $session.Component) -allowFailure | Out-Null
+        Invoke-Adb $session.Serial @(
+            'reverse', '--remove', "tcp:$($session.Port)") -allowFailure | Out-Null
+    }
     Add-Log (Get-Text 'sharingStopped' @($mode))
 }
 
@@ -235,7 +261,7 @@ function Start-ShareSession {
             return
         }
 
-        Ensure-Companion $serial
+        $companionReady = Ensure-Companion $serial
         $quality = [string]$script:resolutionCombo.SelectedItem
         $fps = [string]$script:fpsCombo.SelectedItem
         $bitrate = [string]$script:bitrateCombo.SelectedItem
@@ -293,14 +319,27 @@ function Start-ShareSession {
             throw (Get-Text 'startupExit')
         }
 
-        $listener = [System.Net.Sockets.TcpListener]::new(
-            [System.Net.IPAddress]::Loopback,
-            $port)
-        $listener.Start()
-        Invoke-Adb $serial @('reverse', "tcp:$port", "tcp:$port") | Out-Null
-        Invoke-Adb $serial @(
-            'shell', '--', 'am', 'start-foreground-service', '-n', $component,
-            '--ei', 'port', [string]$port) | Out-Null
+        $listener = $null
+        $companionActive = $false
+        if ($companionReady) {
+            try {
+                $listener = [System.Net.Sockets.TcpListener]::new(
+                    [System.Net.IPAddress]::Loopback,
+                    $port)
+                $listener.Start()
+                Invoke-Adb $serial @('reverse', "tcp:$port", "tcp:$port") | Out-Null
+                Invoke-Adb $serial @(
+                    'shell', '--', 'am', 'start-foreground-service', '-n', $component,
+                    '--ei', 'port', [string]$port) | Out-Null
+                $companionActive = $true
+            } catch {
+                try { $listener.Stop() } catch {}
+                $listener = $null
+                Invoke-Adb $serial @(
+                    'reverse', '--remove', "tcp:$port") -allowFailure | Out-Null
+                Add-Log (Get-Text 'companionUnavailable' @($_.Exception.Message))
+            }
+        }
 
         $script:sessions[$mode] = [pscustomobject]@{
             Mode = $mode
@@ -309,6 +348,7 @@ function Start-ShareSession {
             Component = $component
             Process = $process
             Listener = $listener
+            CompanionActive = $companionActive
         }
 
         if ($mode -eq 'desktop') {
@@ -332,7 +372,11 @@ function Start-ShareSession {
             }
         }
 
-        Add-Log (Get-Text 'sharingActive' @($mode))
+        if ($companionActive) {
+            Add-Log (Get-Text 'sharingActiveWithCompanion' @($mode))
+        } else {
+            Add-Log (Get-Text 'sharingActive' @($mode))
+        }
     } catch {
         Add-Log (Get-Text 'startFailed' @($_.Exception.Message))
         [System.Windows.Forms.MessageBox]::Show(
@@ -712,7 +756,7 @@ $pollTimer.Add_Tick({
             Stop-ShareSession $mode $false
             continue
         }
-        if ($session.Listener.Pending()) {
+        if ($session.CompanionActive -and $session.Listener.Pending()) {
             $client = $session.Listener.AcceptTcpClient()
             try {
                 $client.ReceiveTimeout = 2500
