@@ -38,6 +38,7 @@ $script:fpsCombo = $null
 $script:bitrateCombo = $null
 $script:audioCheck = $null
 $script:screenOffCheck = $null
+$script:fullscreenCheck = $null
 $script:addressBox = $null
 $script:pairCodeBox = $null
 
@@ -235,6 +236,9 @@ function Start-ShareSession {
             "--window-x=$($placement.X)",
             "--window-y=$($placement.Y)"
         )
+        if ($script:fullscreenCheck.Checked) {
+            $scrcpyArguments += '--fullscreen'
+        }
         if ($script:audioCheck.Checked) {
             $scrcpyArguments += @('--audio-source=output', '--audio-codec=aac')
         } else {
@@ -432,6 +436,7 @@ function Load-Settings {
         if ('bitrate' -in $propertyNames) { Set-ComboSelection $script:bitrateCombo ([string]$settings.bitrate) }
         if ('audio' -in $propertyNames) { $script:audioCheck.Checked = [bool]$settings.audio }
         if ('screenOff' -in $propertyNames) { $script:screenOffCheck.Checked = [bool]$settings.screenOff }
+        if ('fullscreen' -in $propertyNames) { $script:fullscreenCheck.Checked = [bool]$settings.fullscreen }
     } catch {
         Add-Log (Get-Text 'settingsLoadFailed' @($_.Exception.Message))
     }
@@ -451,6 +456,7 @@ function Save-Settings {
             bitrate = [string]$script:bitrateCombo.SelectedItem
             audio = [bool]$script:audioCheck.Checked
             screenOff = [bool]$script:screenOffCheck.Checked
+            fullscreen = [bool]$script:fullscreenCheck.Checked
         }
         $settingsDirectory = Split-Path $script:settingsPath -Parent
         New-Item -ItemType Directory -Path $settingsDirectory -Force | Out-Null
@@ -642,6 +648,12 @@ $script:screenOffCheck.Text = Get-Text 'turnScreenOff'
 $script:screenOffCheck.Location = New-Object Drawing.Point(105, 110)
 $script:screenOffCheck.Size = New-Object Drawing.Size(250, 25)
 $shareGroup.Controls.Add($script:screenOffCheck)
+
+$script:fullscreenCheck = New-Object System.Windows.Forms.CheckBox
+$script:fullscreenCheck.Text = Get-Text 'fullscreenDisplay'
+$script:fullscreenCheck.Location = New-Object Drawing.Point(475, 150)
+$script:fullscreenCheck.Size = New-Object Drawing.Size(150, 25)
+$shareGroup.Controls.Add($script:fullscreenCheck)
 
 $startButton = New-Object System.Windows.Forms.Button
 $startButton.Text = Get-Text 'startSharing'
