@@ -12,6 +12,6 @@
 4. 新增界面文字优先放入 `locales/zh-CN.json`。
 5. 修改通知助手后，用 JDK 17、Android SDK 和 Gradle 8.9 执行 `gradle :app:assembleDebug`。
 6. 不要提交 `tools/scrcpy`、Gradle 缓存、签名密钥或包含个人信息的日志。
+7. 发布会影响用户使用的新版本时，请同步递增根目录的 `VERSION`；一键更新依赖该文件判断是否有新版本。
 
 Pull Request 请简要说明改动目的、测试过的设备/系统，以及是否影响普通镜像、桌面模式、无线连接或通知停止功能。
-

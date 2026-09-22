@@ -18,6 +18,15 @@ $script:scrcpyPath = Join-Path $script:scrcpyDir 'scrcpy.exe'
 # directory. Override stale or malformed system/user values so that both this
 # app and scrcpy always use the adb.exe downloaded alongside scrcpy.
 $env:ADB = $script:adbPath
+$script:versionPath = Join-Path $script:root 'VERSION'
+$script:updateScript = Join-Path $script:root 'Update.ps1'
+$script:settingsPath = Join-Path $script:root 'data\settings.json'
+$script:currentVersion = if (Test-Path -LiteralPath $script:versionPath) {
+    ([IO.File]::ReadAllText($script:versionPath, [Text.Encoding]::UTF8)).Trim()
+} else {
+    '0.0.0'
+}
+$script:lastDeviceSerial = ''
 $script:companionApk = Join-Path $script:root 'assets\companion.apk'
 $script:companionPackage = 'dev.androidscreenshare.companion'
 $script:sessions = @{}
@@ -89,7 +98,7 @@ function Get-SelectedSerial {
 function Refresh-Devices {
     try {
         Invoke-Adb '' @('start-server') -allowFailure | Out-Null
-        $previous = $null
+        $previous = $script:lastDeviceSerial
         if ($script:deviceCombo.SelectedItem) {
             $previous = [string]$script:deviceCombo.SelectedItem.Serial
         }
@@ -123,6 +132,7 @@ function Refresh-Devices {
                 }
             }
             $script:deviceCombo.SelectedIndex = $index
+            $script:lastDeviceSerial = [string]$items[$index].Serial
         }
         Add-Log (Get-Text 'foundDevices' @($items.Count))
     } catch {
@@ -395,6 +405,113 @@ function Enable-WirelessFromUsb {
     }
 }
 
+function Set-ComboSelection($combo, [string]$value) {
+    if (-not $value) { return }
+    for ($i = 0; $i -lt $combo.Items.Count; $i++) {
+        if ([string]$combo.Items[$i] -eq $value) {
+            $combo.SelectedIndex = $i
+            return
+        }
+    }
+}
+
+function Load-Settings {
+    if (-not (Test-Path -LiteralPath $script:settingsPath -PathType Leaf)) { return }
+    try {
+        $settings = ([IO.File]::ReadAllText($script:settingsPath, [Text.Encoding]::UTF8) | ConvertFrom-Json)
+        $propertyNames = @($settings.PSObject.Properties.Name)
+        if ('deviceSerial' -in $propertyNames) { $script:lastDeviceSerial = [string]$settings.deviceSerial }
+        if ('address' -in $propertyNames -and [string]$settings.address -match '^\d{1,3}(?:\.\d{1,3}){3}:\d+$') {
+            $script:addressBox.Text = [string]$settings.address
+        }
+        if ('mode' -in $propertyNames) {
+            $script:modeCombo.SelectedIndex = if ([string]$settings.mode -eq 'desktop') { 1 } else { 0 }
+        }
+        if ('resolution' -in $propertyNames) { Set-ComboSelection $script:resolutionCombo ([string]$settings.resolution) }
+        if ('fps' -in $propertyNames) { Set-ComboSelection $script:fpsCombo ([string]$settings.fps) }
+        if ('bitrate' -in $propertyNames) { Set-ComboSelection $script:bitrateCombo ([string]$settings.bitrate) }
+        if ('audio' -in $propertyNames) { $script:audioCheck.Checked = [bool]$settings.audio }
+        if ('screenOff' -in $propertyNames) { $script:screenOffCheck.Checked = [bool]$settings.screenOff }
+    } catch {
+        Add-Log (Get-Text 'settingsLoadFailed' @($_.Exception.Message))
+    }
+}
+
+function Save-Settings {
+    try {
+        if ($script:deviceCombo.SelectedItem) {
+            $script:lastDeviceSerial = [string]$script:deviceCombo.SelectedItem.Serial
+        }
+        $settings = [ordered]@{
+            deviceSerial = $script:lastDeviceSerial
+            address = $script:addressBox.Text.Trim()
+            mode = if ($script:modeCombo.SelectedIndex -eq 1) { 'desktop' } else { 'mirror' }
+            resolution = [string]$script:resolutionCombo.SelectedItem
+            fps = [string]$script:fpsCombo.SelectedItem
+            bitrate = [string]$script:bitrateCombo.SelectedItem
+            audio = [bool]$script:audioCheck.Checked
+            screenOff = [bool]$script:screenOffCheck.Checked
+        }
+        $settingsDirectory = Split-Path $script:settingsPath -Parent
+        New-Item -ItemType Directory -Path $settingsDirectory -Force | Out-Null
+        $json = $settings | ConvertTo-Json
+        [IO.File]::WriteAllText($script:settingsPath, $json, [Text.UTF8Encoding]::new($false))
+    } catch {
+        Add-Log (Get-Text 'settingsSaveFailed' @($_.Exception.Message))
+    }
+}
+
+function Check-ForUpdate {
+    $previousCursor = $form.Cursor
+    try {
+        $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        $updateButton.Enabled = $false
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $cacheBuster = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $versionUrl = "https://raw.githubusercontent.com/OrangeYi/android-screen-share/main/VERSION?t=$cacheBuster"
+        $versionResponse = Invoke-WebRequest -UseBasicParsing -Uri $versionUrl
+        $remoteVersionText = if ($versionResponse.Content -is [byte[]]) {
+            [Text.Encoding]::UTF8.GetString($versionResponse.Content).Trim()
+        } else {
+            ([string]$versionResponse.Content).Trim()
+        }
+        $currentVersion = [Version]$script:currentVersion
+        $remoteVersion = [Version]$remoteVersionText
+        if ($remoteVersion -le $currentVersion) {
+            [System.Windows.Forms.MessageBox]::Show(
+                (Get-Text 'latestVersion' @($script:currentVersion)),
+                (Get-Text 'appTitle')) | Out-Null
+            return
+        }
+        if (-not (Test-Path -LiteralPath $script:updateScript -PathType Leaf)) {
+            throw (Get-Text 'updaterMissing')
+        }
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            (Get-Text 'updatePrompt' @($script:currentVersion, $remoteVersionText)),
+            (Get-Text 'updateAvailable'),
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Information)
+        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+        Save-Settings
+        $arguments = '-NoProfile -ExecutionPolicy Bypass -Sta -File "{0}" -InstallRoot "{1}" -NoConfirm -Force -Restart -WaitForProcessId {2}' -f `
+            $script:updateScript, $script:root, $PID
+        Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -WorkingDirectory $script:root -WindowStyle Hidden
+        $form.Close()
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            (Get-Text 'updateFailed' @($_.Exception.Message)),
+            (Get-Text 'updateFailedTitle'),
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    } finally {
+        if (-not $form.IsDisposed) {
+            $form.Cursor = $previousCursor
+            $updateButton.Enabled = $true
+        }
+    }
+}
+
 function New-Label([string]$text, [int]$x, [int]$y, [int]$width = 150) {
     $label = New-Object System.Windows.Forms.Label
     $label.Text = $text
@@ -404,7 +521,7 @@ function New-Label([string]$text, [int]$x, [int]$y, [int]$width = 150) {
 }
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text = Get-Text 'appTitle'
+$form.Text = "$(Get-Text 'appTitle') v$($script:currentVersion)"
 $form.StartPosition = 'CenterScreen'
 $form.Size = New-Object Drawing.Size(760, 650)
 $form.MinimumSize = New-Object Drawing.Size(760, 650)
@@ -548,6 +665,13 @@ $desktopNote.ForeColor = [Drawing.Color]::DimGray
 $shareGroup.Controls.Add($desktopNote)
 
 $form.Controls.Add((New-Label (Get-Text 'status') 24 410 100))
+$updateButton = New-Object System.Windows.Forms.Button
+$updateButton.Text = Get-Text 'checkUpdate'
+$updateButton.Location = New-Object Drawing.Point(610, 402)
+$updateButton.Size = New-Object Drawing.Size(110, 30)
+$updateButton.Add_Click({ Check-ForUpdate })
+$form.Controls.Add($updateButton)
+
 $script:logBox = New-Object System.Windows.Forms.TextBox
 $script:logBox.Location = New-Object Drawing.Point(20, 438)
 $script:logBox.Size = New-Object Drawing.Size(700, 150)
@@ -556,6 +680,8 @@ $script:logBox.ReadOnly = $true
 $script:logBox.ScrollBars = 'Vertical'
 $script:logBox.Anchor = 'Top,Bottom,Left,Right'
 $form.Controls.Add($script:logBox)
+
+Load-Settings
 
 $pollTimer = New-Object System.Windows.Forms.Timer
 $pollTimer.Interval = 200
@@ -606,6 +732,7 @@ $form.Add_Shown({
 
 $form.Add_FormClosing({
     $pollTimer.Stop()
+    Save-Settings
     foreach ($mode in @($script:sessions.Keys)) {
         Stop-ShareSession $mode
     }
