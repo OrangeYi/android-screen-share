@@ -38,7 +38,6 @@ $script:fpsCombo = $null
 $script:bitrateCombo = $null
 $script:audioCheck = $null
 $script:screenOffCheck = $null
-$script:fullscreenCheck = $null
 $script:addressBox = $null
 $script:pairCodeBox = $null
 
@@ -172,10 +171,6 @@ function Get-CursorPlacement {
     return [pscustomobject]@{
         X = $screen.WorkingArea.Left + 24
         Y = $screen.WorkingArea.Top + 24
-        WorkX = $screen.WorkingArea.Left
-        WorkY = $screen.WorkingArea.Top
-        WorkWidth = $screen.WorkingArea.Width
-        WorkHeight = $screen.WorkingArea.Height
     }
 }
 
@@ -230,17 +225,6 @@ function Start-ShareSession {
             $beforeIds = @(Get-VirtualDisplayIds $serial)
         }
 
-        $windowX = if ($mode -eq 'desktop' -and $script:fullscreenCheck.Checked) {
-            $placement.WorkX
-        } else {
-            $placement.X
-        }
-        $windowY = if ($mode -eq 'desktop' -and $script:fullscreenCheck.Checked) {
-            $placement.WorkY
-        } else {
-            $placement.Y
-        }
-
         $scrcpyArguments = @(
             '-s', $serial,
             '--video-codec=h264',
@@ -248,19 +232,9 @@ function Start-ShareSession {
             "--video-bit-rate=$bitrate",
             '--video-buffer=0',
             '--audio-buffer=80',
-            "--window-x=$windowX",
-            "--window-y=$windowY"
+            "--window-x=$($placement.X)",
+            "--window-y=$($placement.Y)"
         )
-        if ($script:fullscreenCheck.Checked) {
-            if ($mode -eq 'desktop') {
-                $scrcpyArguments += @(
-                    '--window-borderless',
-                    "--window-width=$($placement.WorkWidth)",
-                    "--window-height=$($placement.WorkHeight)")
-            } else {
-                $scrcpyArguments += '--fullscreen'
-            }
-        }
         if ($script:audioCheck.Checked) {
             $scrcpyArguments += @('--audio-source=output', '--audio-codec=aac')
         } else {
@@ -458,7 +432,6 @@ function Load-Settings {
         if ('bitrate' -in $propertyNames) { Set-ComboSelection $script:bitrateCombo ([string]$settings.bitrate) }
         if ('audio' -in $propertyNames) { $script:audioCheck.Checked = [bool]$settings.audio }
         if ('screenOff' -in $propertyNames) { $script:screenOffCheck.Checked = [bool]$settings.screenOff }
-        if ('fullscreen' -in $propertyNames) { $script:fullscreenCheck.Checked = [bool]$settings.fullscreen }
     } catch {
         Add-Log (Get-Text 'settingsLoadFailed' @($_.Exception.Message))
     }
@@ -478,7 +451,6 @@ function Save-Settings {
             bitrate = [string]$script:bitrateCombo.SelectedItem
             audio = [bool]$script:audioCheck.Checked
             screenOff = [bool]$script:screenOffCheck.Checked
-            fullscreen = [bool]$script:fullscreenCheck.Checked
         }
         $settingsDirectory = Split-Path $script:settingsPath -Parent
         New-Item -ItemType Directory -Path $settingsDirectory -Force | Out-Null
@@ -670,12 +642,6 @@ $script:screenOffCheck.Text = Get-Text 'turnScreenOff'
 $script:screenOffCheck.Location = New-Object Drawing.Point(105, 110)
 $script:screenOffCheck.Size = New-Object Drawing.Size(250, 25)
 $shareGroup.Controls.Add($script:screenOffCheck)
-
-$script:fullscreenCheck = New-Object System.Windows.Forms.CheckBox
-$script:fullscreenCheck.Text = Get-Text 'fullscreenDisplay'
-$script:fullscreenCheck.Location = New-Object Drawing.Point(475, 150)
-$script:fullscreenCheck.Size = New-Object Drawing.Size(150, 25)
-$shareGroup.Controls.Add($script:fullscreenCheck)
 
 $startButton = New-Object System.Windows.Forms.Button
 $startButton.Text = Get-Text 'startSharing'
