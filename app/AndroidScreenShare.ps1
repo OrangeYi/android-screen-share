@@ -27,6 +27,9 @@ $script:currentVersion = if (Test-Path -LiteralPath $script:versionPath) {
     '0.0.0'
 }
 $script:lastDeviceSerial = ''
+$script:lastDeviceIdentity = ''
+$script:refreshingDevices = $false
+. (Join-Path $PSScriptRoot 'WirelessDiscovery.ps1')
 $script:companionApk = Join-Path $script:root 'assets\companion.apk'
 $script:companionPackage = 'dev.androidscreenshare.companion'
 $script:companionVersionCode = 2
@@ -96,28 +99,37 @@ function Get-SelectedSerial {
     return [string]$selected.Serial
 }
 
-function Refresh-Devices {
+function Refresh-Devices([switch]$ListOnly, [switch]$ForceSearch) {
+    if ($script:refreshingDevices) { return }
+    $script:refreshingDevices = $true
     try {
         Invoke-Adb '' @('start-server') -allowFailure | Out-Null
         $previous = $script:lastDeviceSerial
         if ($script:deviceCombo.SelectedItem) {
             $previous = [string]$script:deviceCombo.SelectedItem.Serial
+            $script:lastDeviceIdentity = [string]$script:deviceCombo.SelectedItem.Identity
         }
 
+        $devices = if ($ListOnly) { @(Get-DiscoveryDevices) } else {
+            @(Find-WirelessDevices $previous $script:lastDeviceIdentity $script:addressBox.Text.Trim() -ForceSearch:$ForceSearch)
+        }
         $items = @()
-        foreach ($line in (Invoke-Adb '' @('devices', '-l') -allowFailure)) {
-            if ($line -match '^(\S+)\s+device(?:\s+(.*))?$') {
-                $serial = $Matches[1]
-                $details = $Matches[2]
-                $model = Get-Text 'androidDevice'
-                if ($details -match '\bmodel:(\S+)') {
-                    $model = $Matches[1].Replace('_', ' ')
-                }
-                $transport = if ($serial -match ':') { Get-Text 'wifi' } else { Get-Text 'usb' }
-                $items += [pscustomobject]@{
-                    Serial = $serial
-                    Label = "$model  [$transport]  $serial"
-                }
+        # A wireless device may appear under both its mDNS name and IP endpoint.
+        foreach ($group in @($devices | Group-Object Identity)) {
+            $device = $group.Group | Sort-Object @{Expression={
+                if ($_.Serial -eq $previous) {0} elseif ($_.Serial -match ':|_adb') {1} else {2}
+            }} | Select-Object -First 1
+            $serial = $device.Serial
+            $details = $device.Details
+            $model = Get-Text 'androidDevice'
+            if ($details -match '\bmodel:(\S+)') {
+                $model = $Matches[1].Replace('_', ' ')
+            }
+            $transport = if ($serial -match ':|_adb') { Get-Text 'wifi' } else { Get-Text 'usb' }
+            $items += [pscustomobject]@{
+                Serial = $serial
+                Identity = $device.Identity
+                Label = "$model  [$transport]  $serial"
             }
         }
 
@@ -126,18 +138,25 @@ function Refresh-Devices {
             [void]$script:deviceCombo.Items.Add($item)
         }
         if ($items.Count -gt 0) {
-            $index = 0
+            $index = -1
             if ($previous) {
                 for ($i = 0; $i -lt $items.Count; $i++) {
-                    if ($items[$i].Serial -eq $previous) { $index = $i; break }
+                    if ($items[$i].Serial -eq $previous -or
+                        ($script:lastDeviceIdentity -and $items[$i].Identity -eq $script:lastDeviceIdentity)) { $index = $i; break }
                 }
             }
+            if ($index -lt 0 -and -not $previous) { $index = 0 }
             $script:deviceCombo.SelectedIndex = $index
-            $script:lastDeviceSerial = [string]$items[$index].Serial
+            if ($index -ge 0) {
+                $script:lastDeviceSerial = [string]$items[$index].Serial
+                $script:lastDeviceIdentity = [string]$items[$index].Identity
+            }
         }
         Add-Log (Get-Text 'foundDevices' @($items.Count))
     } catch {
         Add-Log (Get-Text 'refreshFailed' @($_.Exception.Message))
+    } finally {
+        $script:refreshingDevices = $false
     }
 }
 
@@ -209,9 +228,7 @@ function Get-VirtualDisplayIds([string]$serial) {
     $lines = Invoke-Adb $serial @(
         'shell', '--', 'cmd', 'display', 'get-displays', '-i', '--type', 'virtual') -allowFailure
     foreach ($line in $lines) {
-        foreach ($match in [regex]::Matches([string]$line, '\d+')) {
-            $ids += [int]$match.Value
-        }
+        if ([string]$line -match '^\s*(\d+)\s*$') { $ids += [int]$Matches[1] }
     }
 
     # Android 12 and some vendor builds do not implement
@@ -255,6 +272,7 @@ function Start-ShareSession {
         }
 
         $serial = Get-SelectedSerial
+        Save-Settings
         $mode = if ($script:modeCombo.SelectedIndex -eq 1) { 'desktop' } else { 'mirror' }
         if ($script:sessions.ContainsKey($mode)) {
             Add-Log (Get-Text 'alreadyRunning' @($mode))
@@ -360,9 +378,6 @@ function Start-ShareSession {
                 $displayId = $currentIds |
                     Where-Object { $beforeIds -notcontains $_ } |
                     Select-Object -First 1
-                if ($null -eq $displayId -and $currentIds.Count -gt 0) {
-                    $displayId = $currentIds | Select-Object -Last 1
-                }
                 if ($null -ne $displayId) { break }
             }
             if ($null -ne $displayId) {
@@ -390,13 +405,14 @@ function Start-ShareSession {
 function Connect-WirelessAddress {
     try {
         $address = $script:addressBox.Text.Trim()
-        if ($address -notmatch '^\d{1,3}(?:\.\d{1,3}){3}:\d+$') {
+        if (-not (Test-WirelessEndpoint $address)) {
             throw (Get-Text 'addressExample')
         }
-        $result = Invoke-Adb '' @('connect', $address) -allowFailure
+        $result = Invoke-DiscoveryAdb @('connect', $address)
         Add-Log ($result -join ' ')
         Start-Sleep -Milliseconds 500
-        Refresh-Devices
+        Refresh-Devices -ListOnly
+        Save-Settings
     } catch {
         Add-Log (Get-Text 'connectFailed' @($_.Exception.Message))
     }
@@ -411,6 +427,12 @@ function Pair-WirelessAddress {
         }
         $result = Invoke-Adb '' @('pair', $address, $code) -allowFailure
         Add-Log ($result -join ' ')
+        if (($result -join ' ') -match 'Successfully paired') {
+            $script:pairCodeBox.Clear()
+            $script:addressBox.Clear()
+        } else { return }
+        Refresh-Devices -ForceSearch
+        Save-Settings
     } catch {
         Add-Log (Get-Text 'pairFailed' @($_.Exception.Message))
     }
@@ -452,7 +474,7 @@ function Get-DeviceWifiIpv4Address([string]$serial) {
 function Enable-WirelessFromUsb {
     try {
         $serial = Get-SelectedSerial
-        if ($serial -match ':') {
+        if ($serial -match ':|_adb') {
             throw (Get-Text 'selectUsb')
         }
         $wifiIp = Get-DeviceWifiIpv4Address $serial
@@ -463,7 +485,9 @@ function Enable-WirelessFromUsb {
         $result = Invoke-Adb '' @('connect', $address)
         $script:addressBox.Text = $address
         Add-Log ($result -join ' ')
-        Refresh-Devices
+        $script:lastDeviceSerial = $address
+        Refresh-Devices -ListOnly
+        Save-Settings
     } catch {
         Add-Log (Get-Text 'usbWifiFailed' @($_.Exception.Message))
     }
@@ -479,12 +503,29 @@ function Set-ComboSelection($combo, [string]$value) {
     }
 }
 
+function Save-InputDiagnostics {
+    try {
+        $serial = Get-SelectedSerial
+        $directory = Join-Path $script:root 'data\diagnostics'
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+        $path = Join-Path $directory (('input-{0}.txt' -f (Get-Date -Format 'yyyyMMdd-HHmmss-fff')))
+        $sections = @("Android Screen Share $($script:currentVersion)", "Captured: $(Get-Date -Format o)")
+        foreach ($service in @('input', 'display', 'window', 'desktopmode')) {
+            $sections += "`r`n=== dumpsys $service ==="
+            $sections += Invoke-DiscoveryAdb @('-s', $serial, 'shell', 'dumpsys', $service) 6000
+        }
+        [IO.File]::WriteAllText($path, ($sections -join "`r`n"), [Text.UTF8Encoding]::new($false))
+        Add-Log (Get-Text 'inputDiagnosticsSaved' @($path))
+    } catch { Add-Log (Get-Text 'inputDiagnosticsFailed' @($_.Exception.Message)) }
+}
+
 function Load-Settings {
     if (-not (Test-Path -LiteralPath $script:settingsPath -PathType Leaf)) { return }
     try {
         $settings = ([IO.File]::ReadAllText($script:settingsPath, [Text.Encoding]::UTF8) | ConvertFrom-Json)
         $propertyNames = @($settings.PSObject.Properties.Name)
         if ('deviceSerial' -in $propertyNames) { $script:lastDeviceSerial = [string]$settings.deviceSerial }
+        if ('deviceIdentity' -in $propertyNames) { $script:lastDeviceIdentity = [string]$settings.deviceIdentity }
         if ('address' -in $propertyNames -and [string]$settings.address -match '^\d{1,3}(?:\.\d{1,3}){3}:\d+$') {
             $script:addressBox.Text = [string]$settings.address
         }
@@ -505,9 +546,11 @@ function Save-Settings {
     try {
         if ($script:deviceCombo.SelectedItem) {
             $script:lastDeviceSerial = [string]$script:deviceCombo.SelectedItem.Serial
+            $script:lastDeviceIdentity = [string]$script:deviceCombo.SelectedItem.Identity
         }
         $settings = [ordered]@{
             deviceSerial = $script:lastDeviceSerial
+            deviceIdentity = $script:lastDeviceIdentity
             address = $script:addressBox.Text.Trim()
             mode = if ($script:modeCombo.SelectedIndex -eq 1) { 'desktop' } else { 'mirror' }
             resolution = [string]$script:resolutionCombo.SelectedItem
@@ -603,7 +646,7 @@ $refreshButton = New-Object System.Windows.Forms.Button
 $refreshButton.Text = Get-Text 'refresh'
 $refreshButton.Location = New-Object Drawing.Point(625, 19)
 $refreshButton.Size = New-Object Drawing.Size(95, 30)
-$refreshButton.Add_Click({ Refresh-Devices })
+$refreshButton.Add_Click({ Refresh-Devices -ForceSearch; Save-Settings })
 $form.Controls.Add($refreshButton)
 
 $wirelessGroup = New-Object System.Windows.Forms.GroupBox
@@ -724,6 +767,13 @@ $stopButton.Add_Click({
 })
 $shareGroup.Controls.Add($stopButton)
 
+$diagnosticsButton = New-Object System.Windows.Forms.Button
+$diagnosticsButton.Text = Get-Text 'inputDiagnostics'
+$diagnosticsButton.Location = New-Object Drawing.Point(470, 145)
+$diagnosticsButton.Size = New-Object Drawing.Size(190, 34)
+$diagnosticsButton.Add_Click({ Save-InputDiagnostics })
+$shareGroup.Controls.Add($diagnosticsButton)
+
 $desktopNote = New-Label (Get-Text 'desktopNote') 365 104 300
 $desktopNote.ForeColor = [Drawing.Color]::DimGray
 $shareGroup.Controls.Add($desktopNote)
@@ -782,11 +832,12 @@ $pollTimer.Add_Tick({
 })
 
 $form.Add_Shown({
+    $hadPreferredDevice = [bool]$script:lastDeviceSerial
     Refresh-Devices
     $pollTimer.Start()
     if ($AutoStartMode -in @('mirror', 'desktop')) {
         $script:modeCombo.SelectedIndex = if ($AutoStartMode -eq 'desktop') { 1 } else { 0 }
-        if ($script:deviceCombo.Items.Count -eq 1) {
+        if ($script:deviceCombo.SelectedItem -and ($hadPreferredDevice -or $script:deviceCombo.Items.Count -eq 1)) {
             Start-ShareSession
         } else {
             Add-Log (Get-Text 'autoStartOneDevice')
