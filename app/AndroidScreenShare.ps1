@@ -61,6 +61,8 @@ function Add-Log([string]$message) {
     $script:logBox.ScrollToCaret()
 }
 
+. (Join-Path $PSScriptRoot 'SessionDiagnostics.ps1')
+
 function Invoke-Adb(
     [string]$serial,
     [string[]]$adbArguments,
@@ -251,6 +253,7 @@ function Stop-ShareSession([string]$mode, [bool]$killProcess = $true) {
     if (-not $script:sessions.ContainsKey($mode)) { return }
     $session = $script:sessions[$mode]
     $script:sessions.Remove($mode)
+    Stop-SessionDiagnostics $session
 
     if ($killProcess -and -not $session.Process.HasExited) {
         Stop-Process -Id $session.Process.Id -Force -ErrorAction SilentlyContinue
@@ -362,6 +365,9 @@ function Start-ShareSession {
         $script:sessions[$mode] = [pscustomobject]@{
             Mode = $mode
             Serial = $serial
+            Fps = $fps
+            Bitrate = $bitrate
+            Diagnostics = (New-SessionDiagnostics)
             Port = $port
             Component = $component
             Process = $process
@@ -392,6 +398,7 @@ function Start-ShareSession {
         } else {
             Add-Log (Get-Text 'sharingActive' @($mode))
         }
+        Add-Log (Get-Text 'diagnosticEnabled')
     } catch {
         Add-Log (Get-Text 'startFailed' @($_.Exception.Message))
         [System.Windows.Forms.MessageBox]::Show(
@@ -803,9 +810,12 @@ $pollTimer.Add_Tick({
     foreach ($mode in @($script:sessions.Keys)) {
         $session = $script:sessions[$mode]
         if ($session.Process.HasExited) {
+            Add-Log (Get-Text 'scrcpyExited' @($mode, $session.Process.ExitCode))
             Stop-ShareSession $mode $false
             continue
         }
+        Complete-SessionDiagnostics $session
+        Start-SessionDiagnostics $session
         if ($session.CompanionActive -and $session.Listener.Pending()) {
             $client = $session.Listener.AcceptTcpClient()
             try {
