@@ -115,6 +115,11 @@ function Complete-SessionDiagnostics([psobject]$session) {
             (Get-Text 'diagnosticPrefix' @($session.Mode, (Get-SessionTransport $session.Serial))),
             (Get-Text 'diagnosticEncoding' @($session.Fps, $session.Bitrate))
         )
+        if ($session.PSObject.Properties['LastFpsAt']) {
+            if ($null -ne $session.ActualFps -and ((Get-Date) - $session.LastFpsAt).TotalSeconds -le 10) {
+                $parts += Get-Text 'diagnosticActualFps' @($session.ActualFps)
+            } else { $parts += Get-Text 'diagnosticFpsUnavailable' }
+        }
         if ($diagnostics.PingTask) {
             $success = $false
             $pingLatency = '-'

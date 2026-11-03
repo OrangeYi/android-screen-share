@@ -7,6 +7,10 @@ $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+if (-not ('AndroidScreenShare.CapturedProcess' -as [type])) {
+    Add-Type -Path (Join-Path $PSScriptRoot 'DesktopIntegration.cs') -ReferencedAssemblies @(
+        'System.dll', 'System.Core.dll', 'System.Windows.Forms.dll', 'System.Drawing.dll')
+}
 
 $script:root = Split-Path $PSScriptRoot -Parent
 $localePath = Join-Path $script:root 'locales\zh-CN.json'
@@ -44,6 +48,11 @@ $script:audioCheck = $null
 $script:screenOffCheck = $null
 $script:addressBox = $null
 $script:pairCodeBox = $null
+$script:loadingSettings = $true
+$script:applyingPreset = $false
+$script:windowLayouts = @{}
+$script:runLogPath = $null
+$script:hotkeys = $null
 
 function Get-Text([string]$key, [object[]]$values = @()) {
     $value = [string]$script:T.$key
@@ -54,7 +63,11 @@ function Get-Text([string]$key, [object[]]$values = @()) {
 }
 
 function Add-Log([string]$message) {
+    Write-RunLog $message
     if (-not $script:logBox) { return }
+    if ($script:logBox.TextLength -gt 100000) {
+        $script:logBox.Text = $script:logBox.Text.Substring($script:logBox.TextLength - 60000)
+    }
     $timestamp = (Get-Date).ToString('HH:mm:ss')
     $script:logBox.AppendText("[$timestamp] $message`r`n")
     $script:logBox.SelectionStart = $script:logBox.TextLength
@@ -62,6 +75,8 @@ function Add-Log([string]$message) {
 }
 
 . (Join-Path $PSScriptRoot 'SessionDiagnostics.ps1')
+. (Join-Path $PSScriptRoot 'PlaybackControls.ps1')
+. (Join-Path $PSScriptRoot 'ShareSessions.ps1')
 
 function Invoke-Adb(
     [string]$serial,
@@ -162,59 +177,6 @@ function Refresh-Devices([switch]$ListOnly, [switch]$ForceSearch) {
     }
 }
 
-function Ensure-Companion([string]$serial) {
-    try {
-        $installed = Invoke-Adb $serial @('shell', '--', 'pm', 'path', $script:companionPackage) -allowFailure
-        $installedVersionCode = 0
-        if (($installed -join '') -match '^package:') {
-            $packageInfo = Invoke-Adb $serial @(
-                'shell', '--', 'dumpsys', 'package', $script:companionPackage) -allowFailure
-            foreach ($line in $packageInfo) {
-                if ($line -match '\bversionCode=(\d+)') {
-                    $installedVersionCode = [int]$Matches[1]
-                    break
-                }
-            }
-        }
-        if ($installedVersionCode -lt $script:companionVersionCode) {
-            if (-not (Test-Path -LiteralPath $script:companionApk)) {
-                Add-Log (Get-Text 'companionUnavailable' @((Get-Text 'companionMissing')))
-                return $false
-            }
-            if ($installedVersionCode -eq 0) {
-                $answer = [System.Windows.Forms.MessageBox]::Show(
-                    (Get-Text 'installPrompt'),
-                    (Get-Text 'installTitle'),
-                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
-                    [System.Windows.Forms.MessageBoxIcon]::Question)
-                if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
-                    Add-Log (Get-Text 'companionSkipped')
-                    return $false
-                }
-            }
-            Add-Log (Get-Text 'installing')
-            $result = Invoke-Adb $serial @('install', '-r', $script:companionApk) -allowFailure
-            if (($result -join "`n") -match 'INSTALL_FAILED_UPDATE_INCOMPATIBLE') {
-                # Version 1 used a one-off signing key. The helper stores no user data,
-                # so replace that legacy package once and keep future upgrades seamless.
-                Invoke-Adb $serial @('uninstall', $script:companionPackage) -allowFailure | Out-Null
-                $result = Invoke-Adb $serial @('install', $script:companionApk) -allowFailure
-            }
-            if (($result -join "`n") -notmatch 'Success') {
-                Add-Log (Get-Text 'companionUnavailable' @(
-                    (Get-Text 'installFailed' @(($result -join ' ')))))
-                return $false
-            }
-        }
-        Invoke-Adb $serial @(
-            'shell', '--', 'pm', 'grant', $script:companionPackage,
-            'android.permission.POST_NOTIFICATIONS') -allowFailure | Out-Null
-        return $true
-    } catch {
-        Add-Log (Get-Text 'companionUnavailable' @($_.Exception.Message))
-        return $false
-    }
-}
 
 function Get-CursorPlacement {
     $screen = [System.Windows.Forms.Screen]::FromPoint(
@@ -225,189 +187,8 @@ function Get-CursorPlacement {
     }
 }
 
-function Get-VirtualDisplayIds([string]$serial) {
-    $ids = @()
-    $lines = Invoke-Adb $serial @(
-        'shell', '--', 'cmd', 'display', 'get-displays', '-i', '--type', 'virtual') -allowFailure
-    foreach ($line in $lines) {
-        if ([string]$line -match '^\s*(\d+)\s*$') { $ids += [int]$Matches[1] }
-    }
 
-    # Android 12 and some vendor builds do not implement
-    # `cmd display get-displays`. Fall back to dumpsys and select only
-    # virtual displays created by scrcpy, so physical/DeX display ids are not
-    # mistaken for the session we just started.
-    if ($ids.Count -eq 0) {
-        $dump = Invoke-Adb $serial @('shell', '--', 'dumpsys', 'display') -allowFailure
-        $dumpText = $dump -join "`n"
-        foreach ($match in [regex]::Matches(
-            $dumpText,
-            'DisplayInfo\{"scrcpy",\s*displayId\s+(\d+)')) {
-            $ids += [int]$match.Groups[1].Value
-        }
-    }
-    return @($ids | Sort-Object -Unique)
-}
 
-function Stop-ShareSession([string]$mode, [bool]$killProcess = $true) {
-    if (-not $script:sessions.ContainsKey($mode)) { return }
-    $session = $script:sessions[$mode]
-    $script:sessions.Remove($mode)
-    Stop-SessionDiagnostics $session
-
-    if ($killProcess -and -not $session.Process.HasExited) {
-        Stop-Process -Id $session.Process.Id -Force -ErrorAction SilentlyContinue
-    }
-    if ($session.CompanionActive) {
-        try { $session.Listener.Stop() } catch {}
-        Invoke-Adb $session.Serial @(
-            'shell', '--', 'am', 'stopservice', '-n', $session.Component) -allowFailure | Out-Null
-        Invoke-Adb $session.Serial @(
-            'reverse', '--remove', "tcp:$($session.Port)") -allowFailure | Out-Null
-    }
-    Add-Log (Get-Text 'sharingStopped' @($mode))
-}
-
-function Start-ShareSession {
-    try {
-        if (-not (Test-Path -LiteralPath $script:scrcpyPath)) {
-            throw (Get-Text 'scrcpyMissing')
-        }
-
-        $serial = Get-SelectedSerial
-        Save-Settings
-        $mode = if ($script:modeCombo.SelectedIndex -eq 1) { 'desktop' } else { 'mirror' }
-        if ($script:sessions.ContainsKey($mode)) {
-            Add-Log (Get-Text 'alreadyRunning' @($mode))
-            return
-        }
-
-        $companionReady = Ensure-Companion $serial
-        $quality = [string]$script:resolutionCombo.SelectedItem
-        $fps = [string]$script:fpsCombo.SelectedItem
-        $bitrate = [string]$script:bitrateCombo.SelectedItem
-        $placement = Get-CursorPlacement
-        $beforeIds = @()
-        if ($mode -eq 'desktop') {
-            $beforeIds = @(Get-VirtualDisplayIds $serial)
-        }
-
-        $scrcpyArguments = @(
-            '-s', $serial,
-            '--video-codec=h264',
-            "--max-fps=$fps",
-            "--video-bit-rate=$bitrate",
-            '--video-buffer=0',
-            '--audio-buffer=80',
-            "--window-x=$($placement.X)",
-            "--window-y=$($placement.Y)"
-        )
-        if ($script:audioCheck.Checked) {
-            $scrcpyArguments += @('--audio-source=output', '--audio-codec=aac')
-        } else {
-            $scrcpyArguments += '--no-audio'
-        }
-
-        if ($mode -eq 'desktop') {
-            $displaySpec = if ($quality -eq '1440p') {
-                '2560x1440/213'
-            } else {
-                '1920x1080/160'
-            }
-            $scrcpyArguments += @(
-                "--new-display=$displaySpec",
-                '--window-title=AndroidScreenShare-Desktop')
-            $port = 27284
-            $component = 'dev.androidscreenshare.companion/.DesktopShareService'
-        } else {
-            $maxSize = if ($quality -eq '1440p') { '2560' } else { '1920' }
-            $scrcpyArguments += @(
-                "--max-size=$maxSize",
-                '--window-title=AndroidScreenShare-Mirror')
-            if ($script:screenOffCheck.Checked) {
-                $scrcpyArguments += '--turn-screen-off'
-            }
-            $port = 27285
-            $component = 'dev.androidscreenshare.companion/.MirrorShareService'
-        }
-
-        Add-Log (Get-Text 'starting' @($serial, $mode))
-        $process = Start-Process -FilePath $script:scrcpyPath `
-            -WorkingDirectory $script:scrcpyDir `
-            -ArgumentList $scrcpyArguments -PassThru
-        Start-Sleep -Milliseconds 900
-        if ($process.HasExited) {
-            throw (Get-Text 'startupExit')
-        }
-
-        $listener = $null
-        $companionActive = $false
-        if ($companionReady) {
-            try {
-                $listener = [System.Net.Sockets.TcpListener]::new(
-                    [System.Net.IPAddress]::Loopback,
-                    $port)
-                $listener.Start()
-                Invoke-Adb $serial @('reverse', "tcp:$port", "tcp:$port") | Out-Null
-                Invoke-Adb $serial @(
-                    'shell', '--', 'am', 'start-foreground-service', '-n', $component,
-                    '--ei', 'port', [string]$port) | Out-Null
-                $companionActive = $true
-            } catch {
-                try { $listener.Stop() } catch {}
-                $listener = $null
-                Invoke-Adb $serial @(
-                    'reverse', '--remove', "tcp:$port") -allowFailure | Out-Null
-                Add-Log (Get-Text 'companionUnavailable' @($_.Exception.Message))
-            }
-        }
-
-        $script:sessions[$mode] = [pscustomobject]@{
-            Mode = $mode
-            Serial = $serial
-            Fps = $fps
-            Bitrate = $bitrate
-            Diagnostics = (New-SessionDiagnostics)
-            Port = $port
-            Component = $component
-            Process = $process
-            Listener = $listener
-            CompanionActive = $companionActive
-        }
-
-        if ($mode -eq 'desktop') {
-            $displayId = $null
-            $timer = [Diagnostics.Stopwatch]::StartNew()
-            while ($timer.ElapsedMilliseconds -lt 6000 -and -not $process.HasExited) {
-                Start-Sleep -Milliseconds 250
-                $currentIds = @(Get-VirtualDisplayIds $serial)
-                $displayId = $currentIds |
-                    Where-Object { $beforeIds -notcontains $_ } |
-                    Select-Object -First 1
-                if ($null -ne $displayId) { break }
-            }
-            if ($null -ne $displayId) {
-                Invoke-Adb $serial @(
-                    'shell', '--', 'input', '-d', [string]$displayId,
-                    'keyevent', 'KEYCODE_HOME') -allowFailure | Out-Null
-            }
-        }
-
-        if ($companionActive) {
-            Add-Log (Get-Text 'sharingActiveWithCompanion' @($mode))
-        } else {
-            Add-Log (Get-Text 'sharingActive' @($mode))
-        }
-        Add-Log (Get-Text 'diagnosticEnabled')
-    } catch {
-        Add-Log (Get-Text 'startFailed' @($_.Exception.Message))
-        [System.Windows.Forms.MessageBox]::Show(
-            $_.Exception.Message,
-            (Get-Text 'startFailedTitle'),
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
-    }
-}
 
 function Connect-WirelessAddress {
     try {
@@ -544,12 +325,28 @@ function Load-Settings {
         if ('bitrate' -in $propertyNames) { Set-ComboSelection $script:bitrateCombo ([string]$settings.bitrate) }
         if ('audio' -in $propertyNames) { $script:audioCheck.Checked = [bool]$settings.audio }
         if ('screenOff' -in $propertyNames) { $script:screenOffCheck.Checked = [bool]$settings.screenOff }
+        if ('playbackPreset' -in $propertyNames -and $settings.playbackPreset -in @('control', 'movie', 'custom')) {
+            $script:presetCombo.SelectedIndex = [Array]::IndexOf(@('control', 'movie', 'custom'), [string]$settings.playbackPreset)
+        }
+        if ('videoBuffer' -in $propertyNames) { $script:bufferInput.Value = [Math]::Max(0, [Math]::Min(1000, [int]$settings.videoBuffer)) }
+        if ('topmost' -in $propertyNames) { $script:topmostCheck.Checked = [bool]$settings.topmost }
+        if ('mini' -in $propertyNames) { $script:miniCheck.Checked = [bool]$settings.mini }
+        if ('rememberWindow' -in $propertyNames) { $script:rememberWindowCheck.Checked = [bool]$settings.rememberWindow }
+        if ('hotkeyProfile' -in $propertyNames -and $settings.hotkeyProfile -in @('CtrlAlt', 'CtrlShift', 'Off')) {
+            $script:hotkeyCombo.SelectedIndex = [Array]::IndexOf(@('CtrlAlt', 'CtrlShift', 'Off'), [string]$settings.hotkeyProfile)
+        }
+        if ('windowLayouts' -in $propertyNames -and $settings.windowLayouts) {
+            foreach ($item in $settings.windowLayouts.PSObject.Properties) {
+                if ($item.Name -match '^(mirror|desktop)\.(normal|mini)$') { $script:windowLayouts[$item.Name] = $item.Value }
+            }
+        }
     } catch {
         Add-Log (Get-Text 'settingsLoadFailed' @($_.Exception.Message))
     }
 }
 
 function Save-Settings {
+    if ($script:loadingSettings) { return }
     try {
         if ($script:deviceCombo.SelectedItem) {
             $script:lastDeviceSerial = [string]$script:deviceCombo.SelectedItem.Serial
@@ -565,10 +362,17 @@ function Save-Settings {
             bitrate = [string]$script:bitrateCombo.SelectedItem
             audio = [bool]$script:audioCheck.Checked
             screenOff = [bool]$script:screenOffCheck.Checked
+            playbackPreset = @('control', 'movie', 'custom')[$script:presetCombo.SelectedIndex]
+            videoBuffer = [int]$script:bufferInput.Value
+            topmost = [bool]$script:topmostCheck.Checked
+            mini = [bool]$script:miniCheck.Checked
+            rememberWindow = [bool]$script:rememberWindowCheck.Checked
+            hotkeyProfile = @('CtrlAlt', 'CtrlShift', 'Off')[$script:hotkeyCombo.SelectedIndex]
+            windowLayouts = $script:windowLayouts
         }
         $settingsDirectory = Split-Path $script:settingsPath -Parent
         New-Item -ItemType Directory -Path $settingsDirectory -Force | Out-Null
-        $json = $settings | ConvertTo-Json
+        $json = $settings | ConvertTo-Json -Depth 6
         [IO.File]::WriteAllText($script:settingsPath, $json, [Text.UTF8Encoding]::new($false))
     } catch {
         Add-Log (Get-Text 'settingsSaveFailed' @($_.Exception.Message))
@@ -637,8 +441,8 @@ function New-Label([string]$text, [int]$x, [int]$y, [int]$width = 150) {
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "$(Get-Text 'appTitle') v$($script:currentVersion)"
 $form.StartPosition = 'CenterScreen'
-$form.Size = New-Object Drawing.Size(760, 650)
-$form.MinimumSize = New-Object Drawing.Size(760, 650)
+$form.Size = New-Object Drawing.Size(760, 850)
+$form.MinimumSize = New-Object Drawing.Size(760, 810)
 $form.Font = New-Object Drawing.Font('Segoe UI', 9)
 
 $form.Controls.Add((New-Label (Get-Text 'device') 24 24 100))
@@ -785,16 +589,121 @@ $desktopNote = New-Label (Get-Text 'desktopNote') 365 104 300
 $desktopNote.ForeColor = [Drawing.Color]::DimGray
 $shareGroup.Controls.Add($desktopNote)
 
-$form.Controls.Add((New-Label (Get-Text 'status') 24 410 100))
+$playbackGroup = New-Object System.Windows.Forms.GroupBox
+$playbackGroup.Text = Get-Text 'playbackControls'
+$playbackGroup.Location = New-Object Drawing.Point(20, 405)
+$playbackGroup.Size = New-Object Drawing.Size(700, 175)
+$form.Controls.Add($playbackGroup)
+
+$playbackGroup.Controls.Add((New-Label (Get-Text 'playbackPreset') 16 28 70))
+$script:presetCombo = New-Object System.Windows.Forms.ComboBox
+$script:presetCombo.Location = New-Object Drawing.Point(90, 24)
+$script:presetCombo.Size = New-Object Drawing.Size(160, 28)
+$script:presetCombo.DropDownStyle = 'DropDownList'
+foreach ($key in @('presetControl', 'presetMovie', 'presetCustom')) { [void]$script:presetCombo.Items.Add((Get-Text $key)) }
+$script:presetCombo.SelectedIndex = 0
+$script:presetCombo.Add_SelectedIndexChanged({ Set-PlaybackPreset })
+$playbackGroup.Controls.Add($script:presetCombo)
+
+$playbackGroup.Controls.Add((New-Label (Get-Text 'videoBuffer') 265 28 85))
+$script:bufferInput = New-Object System.Windows.Forms.NumericUpDown
+$script:bufferInput.Location = New-Object Drawing.Point(350, 24)
+$script:bufferInput.Size = New-Object Drawing.Size(65, 28)
+$script:bufferInput.Maximum = 1000
+$script:bufferInput.Increment = 50
+$script:bufferInput.Add_ValueChanged({
+    if (-not $script:loadingSettings -and -not $script:applyingPreset) {
+        $script:presetCombo.SelectedIndex = 2
+        Save-Settings
+    }
+})
+$playbackGroup.Controls.Add($script:bufferInput)
+
+$script:topmostCheck = New-Object System.Windows.Forms.CheckBox
+$script:topmostCheck.Text = Get-Text 'alwaysOnTop'
+$script:topmostCheck.Location = New-Object Drawing.Point(435, 25)
+$script:topmostCheck.Size = New-Object Drawing.Size(90, 26)
+$script:topmostCheck.Add_CheckedChanged({ Set-ShareWindowOptions })
+$playbackGroup.Controls.Add($script:topmostCheck)
+
+$script:rememberWindowCheck = New-Object System.Windows.Forms.CheckBox
+$script:rememberWindowCheck.Text = Get-Text 'rememberWindow'
+$script:rememberWindowCheck.Location = New-Object Drawing.Point(535, 25)
+$script:rememberWindowCheck.Size = New-Object Drawing.Size(155, 26)
+$script:rememberWindowCheck.Checked = $true
+$script:rememberWindowCheck.Add_CheckedChanged({ Save-Settings })
+$playbackGroup.Controls.Add($script:rememberWindowCheck)
+
+$previousButton = New-Object System.Windows.Forms.Button
+$previousButton.Text = Get-Text 'previousEpisode'
+$previousButton.Location = New-Object Drawing.Point(16, 65)
+$previousButton.Size = New-Object Drawing.Size(120, 32)
+$previousButton.Add_Click({ Send-ShareGesture 'previous' })
+$playbackGroup.Controls.Add($previousButton)
+
+$nextButton = New-Object System.Windows.Forms.Button
+$nextButton.Text = Get-Text 'nextEpisode'
+$nextButton.Location = New-Object Drawing.Point(145, 65)
+$nextButton.Size = New-Object Drawing.Size(120, 32)
+$nextButton.Add_Click({ Send-ShareGesture 'next' })
+$playbackGroup.Controls.Add($nextButton)
+
+$leftButton = New-Object System.Windows.Forms.Button
+$leftButton.Text = Get-Text 'swipeLeft'
+$leftButton.Location = New-Object Drawing.Point(274, 65)
+$leftButton.Size = New-Object Drawing.Size(80, 32)
+$leftButton.Add_Click({ Send-ShareGesture 'left' })
+$playbackGroup.Controls.Add($leftButton)
+
+$rightButton = New-Object System.Windows.Forms.Button
+$rightButton.Text = Get-Text 'swipeRight'
+$rightButton.Location = New-Object Drawing.Point(363, 65)
+$rightButton.Size = New-Object Drawing.Size(80, 32)
+$rightButton.Add_Click({ Send-ShareGesture 'right' })
+$playbackGroup.Controls.Add($rightButton)
+
+$script:miniCheck = New-Object System.Windows.Forms.CheckBox
+$script:miniCheck.Text = Get-Text 'miniWindow'
+$script:miniCheck.Location = New-Object Drawing.Point(456, 69)
+$script:miniCheck.Size = New-Object Drawing.Size(100, 26)
+$script:miniCheck.Add_CheckedChanged({ Set-ShareWindowOptions })
+$playbackGroup.Controls.Add($script:miniCheck)
+
+$logDirectoryButton = New-Object System.Windows.Forms.Button
+$logDirectoryButton.Text = Get-Text 'openRunLogs'
+$logDirectoryButton.Location = New-Object Drawing.Point(565, 65)
+$logDirectoryButton.Size = New-Object Drawing.Size(120, 32)
+$logDirectoryButton.Add_Click({
+    $directory = Join-Path $script:root 'data\logs'
+    [void](New-Item -ItemType Directory -Path $directory -Force)
+    Start-Process -FilePath 'explorer.exe' -ArgumentList ('"' + $directory + '"')
+})
+$playbackGroup.Controls.Add($logDirectoryButton)
+
+$playbackGroup.Controls.Add((New-Label (Get-Text 'gestureHotkeys') 16 112 80))
+$script:hotkeyCombo = New-Object System.Windows.Forms.ComboBox
+$script:hotkeyCombo.Location = New-Object Drawing.Point(100, 108)
+$script:hotkeyCombo.Size = New-Object Drawing.Size(205, 28)
+$script:hotkeyCombo.DropDownStyle = 'DropDownList'
+foreach ($value in @('Ctrl+Alt', 'Ctrl+Shift', (Get-Text 'hotkeysOff'))) { [void]$script:hotkeyCombo.Items.Add($value) }
+$script:hotkeyCombo.SelectedIndex = 0
+$script:hotkeyCombo.Add_SelectedIndexChanged({ if (-not $script:loadingSettings) { Update-ShareHotkeys; Save-Settings } })
+$playbackGroup.Controls.Add($script:hotkeyCombo)
+$playbackGroup.Controls.Add((New-Label (Get-Text 'gestureHotkeyHint') 320 112 365))
+$gestureHint = New-Label (Get-Text 'gestureHint') 16 145 665
+$gestureHint.ForeColor = [Drawing.Color]::DimGray
+$playbackGroup.Controls.Add($gestureHint)
+
+$form.Controls.Add((New-Label (Get-Text 'status') 24 595 100))
 $updateButton = New-Object System.Windows.Forms.Button
 $updateButton.Text = Get-Text 'checkUpdate'
-$updateButton.Location = New-Object Drawing.Point(610, 402)
+$updateButton.Location = New-Object Drawing.Point(610, 587)
 $updateButton.Size = New-Object Drawing.Size(110, 30)
 $updateButton.Add_Click({ Check-ForUpdate })
 $form.Controls.Add($updateButton)
 
 $script:logBox = New-Object System.Windows.Forms.TextBox
-$script:logBox.Location = New-Object Drawing.Point(20, 438)
+$script:logBox.Location = New-Object Drawing.Point(20, 625)
 $script:logBox.Size = New-Object Drawing.Size(700, 150)
 $script:logBox.Multiline = $true
 $script:logBox.ReadOnly = $true
@@ -803,12 +712,18 @@ $script:logBox.Anchor = 'Top,Bottom,Left,Right'
 $form.Controls.Add($script:logBox)
 
 Load-Settings
+$script:loadingSettings = $false
+$script:hotkeys = New-Object AndroidScreenShare.ShareHotkeys
+$script:modeCombo.Add_SelectedIndexChanged({ Sync-ControlSessionOptions })
 
 $pollTimer = New-Object System.Windows.Forms.Timer
 $pollTimer.Interval = 200
 $pollTimer.Add_Tick({
+    $command = ''
+    while ($script:hotkeys.TryRead([ref]$command)) { Send-ShareGesture $command }
     foreach ($mode in @($script:sessions.Keys)) {
         $session = $script:sessions[$mode]
+        Update-ShareProcessLog $session
         if ($session.Process.HasExited) {
             Add-Log (Get-Text 'scrcpyExited' @($mode, $session.Process.ExitCode))
             Stop-ShareSession $mode $false
@@ -816,6 +731,11 @@ $pollTimer.Add_Tick({
         }
         Complete-SessionDiagnostics $session
         Start-SessionDiagnostics $session
+        Update-ShareGesture $session
+        if (((Get-Date) - $session.LastWindowSample).TotalSeconds -ge 1) {
+            Save-SessionWindow $session
+            $session.LastWindowSample = Get-Date
+        }
         if ($session.CompanionActive -and $session.Listener.Pending()) {
             $client = $session.Listener.AcceptTcpClient()
             try {
@@ -857,6 +777,9 @@ $form.Add_Shown({
 
 $form.Add_FormClosing({
     $pollTimer.Stop()
+    $script:hotkeys.Dispose()
+    $script:hotkeys = $null
+    foreach ($session in @($script:sessions.Values)) { Save-SessionWindow $session }
     Save-Settings
     foreach ($mode in @($script:sessions.Keys)) {
         Stop-ShareSession $mode
