@@ -17,28 +17,30 @@ function Get-SwipeCoordinates([int]$width, [int]$height, [string]$action) {
 }
 
 function Get-DisplayInputSize([string]$dump, [int]$displayId) {
+    $size = $null
     foreach ($line in ($dump -split '\r?\n')) {
         if ($line -match "\bdisplayId[ =]+$displayId\b" -and
             $line -match '\breal\s+(\d+)\s*x\s*(\d+)') {
-            return [pscustomobject]@{ Width = [int]$Matches[1]; Height = [int]$Matches[2] }
+            $size = [pscustomobject]@{ Width = [int]$Matches[1]; Height = [int]$Matches[2] }
+            if ($line -match '^\s*mOverrideDisplayInfo=') { return $size }
         }
     }
-    return $null
+    return $size
 }
 
 function Get-GestureArguments([psobject]$session, [string]$action) {
-    if ($session.Mode -eq 'desktop' -and $null -eq $session.DisplayId) {
+    if ($session.Mode -ne 'mirror' -and ($null -eq $session.DisplayId -or $session.DisplayId -le 0)) {
         throw (Get-Text 'gestureDisplayUnknown')
     }
     $width = $session.InputWidth; $height = $session.InputHeight
-    if ($session.Mode -eq 'mirror' -and $session.TextureWidth -gt 0 -and
+    if ($session.Mode -in @('mirror', 'app') -and $session.TextureWidth -gt 0 -and
         (($width -gt $height) -ne ($session.TextureWidth -gt $session.TextureHeight))) {
         $width = $session.InputHeight; $height = $session.InputWidth
     }
     $arguments = @('-s', $session.Serial, 'shell', 'input')
     # Older Android versions have no -d option; the primary display is implicit.
     if ($session.Sdk -ge 29) { $arguments += @('-d', [string]$session.DisplayId) }
-    elseif ($session.Mode -eq 'desktop') { throw (Get-Text 'gestureOldAndroid') }
+    elseif ($session.Mode -ne 'mirror') { throw (Get-Text 'gestureOldAndroid') }
     $arguments += 'swipe'
     $arguments += @(Get-SwipeCoordinates $width $height $action | ForEach-Object { [string]$_ })
     return $arguments
@@ -65,7 +67,7 @@ function Initialize-SessionInput([psobject]$session) {
 }
 
 function Get-ControlSession {
-    $mode = if ($script:modeCombo.SelectedIndex -eq 1) { 'desktop' } else { 'mirror' }
+    $mode = Get-SelectedShareMode
     if (-not $script:sessions.ContainsKey($mode) -or $script:sessions[$mode].Process.HasExited) {
         throw (Get-Text 'gestureNoSession')
     }
@@ -75,6 +77,11 @@ function Get-ControlSession {
 function Send-ShareGesture([string]$action) {
     try {
         $session = Get-ControlSession
+        Update-ShareProcessLog $session
+        if ($session.Mode -eq 'app') {
+            Complete-HongguoPlayback
+            if ($script:playbackInvocation) { return }
+        }
         if ($session.GestureProcess -or ((Get-Date) - $session.LastGesture).TotalMilliseconds -lt 650) { return }
         $arguments = Get-GestureArguments $session $action
         $session.GestureProcess = [AndroidScreenShare.CapturedProcess]::new($script:adbPath, [string[]]$arguments, $script:scrcpyDir)
@@ -94,18 +101,87 @@ function Update-ShareGesture([psobject]$session) {
             while ($session.GestureProcess.TryReadLine([ref]$line)) { $messages += $line }
             throw ($messages -join ' ')
         }
-    } catch { Add-Log (Get-Text 'gestureFailed' @($_.Exception.Message)) }
+    } catch {
+        Add-Log (Get-Text 'gestureFailed' @($_.Exception.Message))
+    }
     finally { $session.GestureProcess.Dispose(); $session.GestureProcess = $null }
 }
 
 function Update-ShareHotkeys {
     if (-not $script:hotkeys) { return }
+    Update-HongguoSpaceShortcut
     $profile = 'Off'
     if ($script:sessions.Count -gt 0) {
         $profile = @('CtrlAlt', 'CtrlShift', 'Off')[$script:hotkeyCombo.SelectedIndex]
     }
     $failed = @($script:hotkeys.Configure($profile))
     if ($failed.Count -gt 0) { Add-Log (Get-Text 'hotkeyConflict' @($failed -join ', ')) }
+}
+
+function Stop-HongguoSpaceShortcut {
+    if ($script:spacePlaybackHook) {
+        $script:spacePlaybackHook.Dispose()
+        $script:spacePlaybackHook = $null
+    }
+    if ($script:playbackWorker) {
+        $script:playbackWorker.Dispose()
+        $script:playbackWorker = $null
+        $script:playbackInvocation = $null
+    }
+}
+
+function Update-HongguoSpaceShortcut {
+    $player = $null
+    if ($script:spacePlaybackCheck -and $script:spacePlaybackCheck.Checked -and $script:sessions.ContainsKey('app')) {
+        $session = $script:sessions.app
+        if ($session.AppPackage -eq 'com.phoenix.read' -and $session.DisplayId -gt 0 -and -not $session.Process.HasExited) {
+            $player = $session.Process.Id
+        }
+    }
+    if ($script:spacePlaybackHook -and $script:spacePlaybackHook.TargetProcessId -eq $player) { return }
+    Stop-HongguoSpaceShortcut
+    if ($player) {
+        try {
+            $script:playbackWorker = [PowerShell]::Create()
+            $script:playbackWorker.Runspace.ThreadOptions = 'ReuseThread'
+            $script:spacePlaybackHook = [AndroidScreenShare.FocusedSpaceHotkey]::new($player, $script:hotkeys.Handle)
+        } catch {
+            Stop-HongguoSpaceShortcut
+            Add-Log (Get-Text 'spacePlaybackFailed' @($_.Exception.Message))
+        }
+    }
+}
+
+function Complete-HongguoPlayback {
+    if (-not $script:playbackInvocation -or -not $script:playbackInvocation.IsCompleted) { return }
+    try {
+        [void]$script:playbackWorker.EndInvoke($script:playbackInvocation)
+        Add-Log (Get-Text 'spacePlaybackSent')
+    } catch {
+        Add-Log (Get-Text 'spacePlaybackFailed' @($_.Exception.Message))
+    } finally {
+        $script:playbackInvocation = $null
+    }
+}
+
+function Send-HongguoPlaybackToggle {
+    if (-not $script:playbackWorker -or -not $script:sessions.ContainsKey('app')) { return }
+    Complete-HongguoPlayback
+    $session = $script:sessions.app
+    Update-ShareGesture $session
+    if ($session.AppPackage -ne 'com.phoenix.read' -or $session.Process.HasExited -or
+        $script:playbackInvocation -or $session.GestureProcess -or $session.DisplayId -le 0 -or
+        -not [AndroidScreenShare.FocusedSpaceHotkey]::HasFocus($session.Process.Id)) { return }
+    try {
+        $worker = Join-Path $script:root 'app\HongguoPlayback.ps1'
+        $script:playbackWorker.Commands.Clear()
+        $script:playbackWorker.Streams.ClearStreams()
+        [void]$script:playbackWorker.AddCommand($worker).AddParameters(@{
+            AdbPath=$script:adbPath; Serial=$session.Serial; DisplayId=$session.DisplayId
+            PlayerPid=$session.Process.Id; RequireFocus=$true
+        })
+        $script:playbackInvocation = $script:playbackWorker.BeginInvoke()
+    } catch { Add-Log (Get-Text 'spacePlaybackFailed' @($_.Exception.Message)) }
 }
 
 function Set-PlaybackPreset {
@@ -200,6 +276,10 @@ function Write-RunLog([string]$message) {
 function Update-ShareProcessLog([psobject]$session) {
     $line = ''
     while ($session.Capture.TryReadLine([ref]$line)) {
+        if ($session.Mode -eq 'app' -and $null -eq $session.DisplayId) {
+            $createdId = Get-ScrcpyCreatedDisplayId $line
+            if ($null -ne $createdId) { $session.DisplayId = $createdId }
+        }
         if ($line -match '\b(\d+(?:\.\d+)?)\s+fps\b') {
             $session.ActualFps = $Matches[1]
             $session.LastFpsAt = Get-Date

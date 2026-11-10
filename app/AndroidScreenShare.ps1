@@ -53,6 +53,11 @@ $script:applyingPreset = $false
 $script:windowLayouts = @{}
 $script:runLogPath = $null
 $script:hotkeys = $null
+$script:appListProbe = $null
+$script:spacePlaybackHook = $null
+$script:spacePlaybackCheck = $null
+$script:playbackWorker = $null
+$script:playbackInvocation = $null
 
 function Get-Text([string]$key, [object[]]$values = @()) {
     $value = [string]$script:T.$key
@@ -75,6 +80,7 @@ function Add-Log([string]$message) {
 }
 
 . (Join-Path $PSScriptRoot 'SessionDiagnostics.ps1')
+. (Join-Path $PSScriptRoot 'IndependentApps.ps1')
 . (Join-Path $PSScriptRoot 'PlaybackControls.ps1')
 . (Join-Path $PSScriptRoot 'ShareSessions.ps1')
 
@@ -317,9 +323,13 @@ function Load-Settings {
         if ('address' -in $propertyNames -and [string]$settings.address -match '^\d{1,3}(?:\.\d{1,3}){3}:\d+$') {
             $script:addressBox.Text = [string]$settings.address
         }
-        if ('mode' -in $propertyNames) {
-            $script:modeCombo.SelectedIndex = if ([string]$settings.mode -eq 'desktop') { 1 } else { 0 }
+        if ('mode' -in $propertyNames -and $settings.mode -in @('mirror', 'desktop', 'app')) {
+            $script:modeCombo.SelectedIndex = [Array]::IndexOf(@('mirror', 'desktop', 'app'), [string]$settings.mode)
         }
+        if ('appPackage' -in $propertyNames) { Set-IndependentAppSelection ([string]$settings.appPackage) }
+        if ('appLandscape' -in $propertyNames -and $settings.appLandscape -eq $true) { $script:appOrientationCombo.SelectedIndex = 1 }
+        if ('appScreenOff' -in $propertyNames) { $script:appScreenOffCheck.Checked = $settings.appScreenOff -eq $true }
+        if ('appSpacePlayback' -in $propertyNames) { $script:spacePlaybackCheck.Checked = $settings.appSpacePlayback -eq $true }
         if ('resolution' -in $propertyNames) { Set-ComboSelection $script:resolutionCombo ([string]$settings.resolution) }
         if ('fps' -in $propertyNames) { Set-ComboSelection $script:fpsCombo ([string]$settings.fps) }
         if ('bitrate' -in $propertyNames) { Set-ComboSelection $script:bitrateCombo ([string]$settings.bitrate) }
@@ -337,7 +347,7 @@ function Load-Settings {
         }
         if ('windowLayouts' -in $propertyNames -and $settings.windowLayouts) {
             foreach ($item in $settings.windowLayouts.PSObject.Properties) {
-                if ($item.Name -match '^(mirror|desktop)\.(normal|mini)$') { $script:windowLayouts[$item.Name] = $item.Value }
+                if ($item.Name -match '^(mirror|desktop|app)\.(normal|mini)$') { $script:windowLayouts[$item.Name] = $item.Value }
             }
         }
     } catch {
@@ -356,7 +366,11 @@ function Save-Settings {
             deviceSerial = $script:lastDeviceSerial
             deviceIdentity = $script:lastDeviceIdentity
             address = $script:addressBox.Text.Trim()
-            mode = if ($script:modeCombo.SelectedIndex -eq 1) { 'desktop' } else { 'mirror' }
+            mode = Get-SelectedShareMode
+            appPackage = if ($script:appCombo.SelectedItem) { [string]$script:appCombo.SelectedItem.Package } else { '' }
+            appLandscape = $script:appOrientationCombo.SelectedIndex -eq 1
+            appScreenOff = [bool]$script:appScreenOffCheck.Checked
+            appSpacePlayback = [bool]$script:spacePlaybackCheck.Checked
             resolution = [string]$script:resolutionCombo.SelectedItem
             fps = [string]$script:fpsCombo.SelectedItem
             bitrate = [string]$script:bitrateCombo.SelectedItem
@@ -516,6 +530,7 @@ $script:modeCombo.Size = New-Object Drawing.Size(235, 28)
 $script:modeCombo.DropDownStyle = 'DropDownList'
 [void]$script:modeCombo.Items.Add((Get-Text 'phoneMirror'))
 [void]$script:modeCombo.Items.Add((Get-Text 'desktopMode'))
+[void]$script:modeCombo.Items.Add((Get-Text 'independentAppMode'))
 $script:modeCombo.SelectedIndex = 0
 $shareGroup.Controls.Add($script:modeCombo)
 
@@ -573,8 +588,7 @@ $stopButton.Text = Get-Text 'stopSelectedMode'
 $stopButton.Location = New-Object Drawing.Point(280, 145)
 $stopButton.Size = New-Object Drawing.Size(170, 34)
 $stopButton.Add_Click({
-    $mode = if ($script:modeCombo.SelectedIndex -eq 1) { 'desktop' } else { 'mirror' }
-    Stop-ShareSession $mode
+    Stop-ShareSession (Get-SelectedShareMode)
 })
 $shareGroup.Controls.Add($stopButton)
 
@@ -585,9 +599,52 @@ $diagnosticsButton.Size = New-Object Drawing.Size(190, 34)
 $diagnosticsButton.Add_Click({ Save-InputDiagnostics })
 $shareGroup.Controls.Add($diagnosticsButton)
 
-$desktopNote = New-Label (Get-Text 'desktopNote') 365 104 300
-$desktopNote.ForeColor = [Drawing.Color]::DimGray
-$shareGroup.Controls.Add($desktopNote)
+$script:desktopNote = New-Label (Get-Text 'desktopNote') 365 104 300
+$script:desktopNote.ForeColor = [Drawing.Color]::DimGray
+$shareGroup.Controls.Add($script:desktopNote)
+
+$appLabel = New-Label (Get-Text 'appPickerLabel') 16 112 85
+$script:appCombo = New-Object System.Windows.Forms.ComboBox
+$script:appCombo.Location = New-Object Drawing.Point(105, 107)
+$script:appCombo.Size = New-Object Drawing.Size(287, 28)
+$script:appCombo.DropDownWidth = 450
+$script:appCombo.DropDownStyle = 'DropDownList'
+$script:appCombo.DisplayMember = 'Label'
+[void]$script:appCombo.Items.Add([pscustomobject]@{ Package='com.phoenix.read'; Label=(Get-Text 'appHongguo') })
+[void]$script:appCombo.Items.Add([pscustomobject]@{ Package='com.android.settings'; Label=(Get-Text 'appAndroidSettings') })
+$script:appCombo.SelectedIndex = 0
+
+$script:appListButton = New-Object System.Windows.Forms.Button
+$script:appListButton.Text = Get-Text 'appListButton'
+$script:appListButton.Location = New-Object Drawing.Point(402, 104)
+$script:appListButton.Size = New-Object Drawing.Size(135, 30)
+$script:appListButton.Add_Click({ Start-IndependentAppList })
+
+$script:appOrientationCombo = New-Object System.Windows.Forms.ComboBox
+$script:appOrientationCombo.Location = New-Object Drawing.Point(550, 107)
+$script:appOrientationCombo.Size = New-Object Drawing.Size(110, 28)
+$script:appOrientationCombo.DropDownStyle = 'DropDownList'
+[void]$script:appOrientationCombo.Items.Add((Get-Text 'appPortrait'))
+[void]$script:appOrientationCombo.Items.Add((Get-Text 'appLandscape'))
+$script:appOrientationCombo.SelectedIndex = 0
+
+$script:appScreenOffCheck = New-Object System.Windows.Forms.CheckBox
+$script:appScreenOffCheck.Text = Get-Text 'appScreenOff'
+$script:appScreenOffCheck.Location = New-Object Drawing.Point(527, 72)
+$script:appScreenOffCheck.Size = New-Object Drawing.Size(165, 25)
+$script:appScreenOffCheck.Checked = $true
+
+$script:spacePlaybackCheck = New-Object System.Windows.Forms.CheckBox
+$script:spacePlaybackCheck.Text = Get-Text 'appSpacePlayback'
+$script:spacePlaybackCheck.Location = New-Object Drawing.Point(552, 28)
+$script:spacePlaybackCheck.Size = New-Object Drawing.Size(140, 26)
+$script:spacePlaybackCheck.Checked = $true
+$script:spacePlaybackCheck.Add_CheckedChanged({
+    if (-not $script:loadingSettings) { Update-HongguoSpaceShortcut; Save-Settings }
+})
+
+$script:appControls = @($appLabel, $script:appCombo, $script:appListButton, $script:appOrientationCombo, $script:appScreenOffCheck, $script:spacePlaybackCheck)
+foreach ($control in $script:appControls) { $shareGroup.Controls.Add($control) }
 
 $playbackGroup = New-Object System.Windows.Forms.GroupBox
 $playbackGroup.Text = Get-Text 'playbackControls'
@@ -714,11 +771,17 @@ $form.Controls.Add($script:logBox)
 Load-Settings
 $script:loadingSettings = $false
 $script:hotkeys = New-Object AndroidScreenShare.ShareHotkeys
-$script:modeCombo.Add_SelectedIndexChanged({ Sync-ControlSessionOptions })
+$script:hotkeys.Add_SpacePressed({
+    if ($script:spacePlaybackHook -and $script:spacePlaybackHook.TakePress()) { Send-HongguoPlaybackToggle }
+})
+Update-IndependentAppControls
+$script:modeCombo.Add_SelectedIndexChanged({ Update-IndependentAppControls; Sync-ControlSessionOptions })
 
 $pollTimer = New-Object System.Windows.Forms.Timer
 $pollTimer.Interval = 200
 $pollTimer.Add_Tick({
+    Complete-IndependentAppList
+    Complete-HongguoPlayback
     $command = ''
     while ($script:hotkeys.TryRead([ref]$command)) { Send-ShareGesture $command }
     foreach ($mode in @($script:sessions.Keys)) {
@@ -765,8 +828,8 @@ $form.Add_Shown({
     $hadPreferredDevice = [bool]$script:lastDeviceSerial
     Refresh-Devices
     $pollTimer.Start()
-    if ($AutoStartMode -in @('mirror', 'desktop')) {
-        $script:modeCombo.SelectedIndex = if ($AutoStartMode -eq 'desktop') { 1 } else { 0 }
+    if ($AutoStartMode -in @('mirror', 'desktop', 'app')) {
+        $script:modeCombo.SelectedIndex = [Array]::IndexOf(@('mirror', 'desktop', 'app'), $AutoStartMode)
         if ($script:deviceCombo.SelectedItem -and ($hadPreferredDevice -or $script:deviceCombo.Items.Count -eq 1)) {
             Start-ShareSession
         } else {
@@ -777,6 +840,8 @@ $form.Add_Shown({
 
 $form.Add_FormClosing({
     $pollTimer.Stop()
+    Stop-IndependentAppList
+    Stop-HongguoSpaceShortcut
     $script:hotkeys.Dispose()
     $script:hotkeys = $null
     foreach ($session in @($script:sessions.Values)) { Save-SessionWindow $session }

@@ -104,6 +104,7 @@ function Stop-ShareSession([string]$mode, [bool]$killProcess = $true) {
 }
 
 function Start-ShareSession {
+    $startedApp = $false
     try {
         if (-not (Test-Path -LiteralPath $script:scrcpyPath)) {
             throw (Get-Text 'scrcpyMissing')
@@ -111,10 +112,23 @@ function Start-ShareSession {
 
         $serial = Get-SelectedSerial
         Save-Settings
-        $mode = if ($script:modeCombo.SelectedIndex -eq 1) { 'desktop' } else { 'mirror' }
+        $mode = Get-SelectedShareMode
         if ($script:sessions.ContainsKey($mode)) {
             Add-Log (Get-Text 'alreadyRunning' @($mode))
             return
+        }
+
+        if (($mode -eq 'app' -and $script:sessions.ContainsKey('desktop')) -or
+            ($mode -eq 'desktop' -and $script:sessions.ContainsKey('app'))) {
+            throw (Get-Text 'appDesktopConflict')
+        }
+
+        $appPackage = ''
+        $appDisplay = $null
+        if ($mode -eq 'app') {
+            $appPackage = Get-SelectedAppPackage
+            $installed = @(Invoke-Adb $serial @('shell', '--', 'pm', 'path', $appPackage) -allowFailure)
+            if (-not ($installed -match '^package:')) { throw (Get-Text 'appNotInstalled' @($appPackage)) }
         }
 
         $companionReady = Ensure-Companion $serial
@@ -150,15 +164,22 @@ function Start-ShareSession {
             $scrcpyArguments += '--no-audio'
         }
 
-        if ($mode -eq 'desktop') {
-            $displaySpec = if ($quality -eq '1440p') {
+        if ($mode -ne 'mirror') {
+            $displaySpec = if ($mode -eq 'app') {
+                $appDisplay = Get-IndependentAppDisplay $quality ($script:appOrientationCombo.SelectedIndex -eq 1)
+                $appDisplay.Spec
+            } elseif ($quality -eq '1440p') {
                 '2560x1440/213'
             } else {
                 '1920x1080/160'
             }
-            $scrcpyArguments += @(
-                "--new-display=$displaySpec",
-                '--window-title=AndroidScreenShare-Desktop')
+            $scrcpyArguments += "--new-display=$displaySpec"
+            if ($mode -eq 'app') {
+                $scrcpyArguments += @("--start-app=$appPackage", '--no-vd-system-decorations',
+                    '--no-power-on', '--window-title=AndroidScreenShare-App')
+                if ($script:appScreenOffCheck.Checked) { $scrcpyArguments += '--turn-screen-off' }
+                Add-Log (Get-Text 'appStarting' @($appPackage))
+            } else { $scrcpyArguments += '--window-title=AndroidScreenShare-Desktop' }
             $port = 27284
             $component = 'dev.androidscreenshare.companion/.DesktopShareService'
         } else {
@@ -209,6 +230,7 @@ function Start-ShareSession {
         $script:sessions[$mode] = [pscustomobject]@{
             Mode = $mode
             Serial = $serial
+            AppPackage = $appPackage
             Fps = $fps
             Bitrate = $bitrate
             Diagnostics = (New-SessionDiagnostics)
@@ -216,8 +238,8 @@ function Start-ShareSession {
             Mini = $script:miniCheck.Checked
             Topmost = $script:topmostCheck.Checked
             DisplayId = $(if ($mode -eq 'mirror') { 0 } else { $null })
-            InputWidth = $(if ($mode -eq 'desktop') { if ($quality -eq '1440p') { 2560 } else { 1920 } } else { 0 })
-            InputHeight = $(if ($mode -eq 'desktop') { if ($quality -eq '1440p') { 1440 } else { 1080 } } else { 0 })
+            InputWidth = $(if ($appDisplay) { $appDisplay.Width } elseif ($mode -eq 'desktop') { if ($quality -eq '1440p') { 2560 } else { 1920 } } else { 0 })
+            InputHeight = $(if ($appDisplay) { $appDisplay.Height } elseif ($mode -eq 'desktop') { if ($quality -eq '1440p') { 1440 } else { 1080 } } else { 0 })
             Sdk = 0
             TextureWidth = 0
             TextureHeight = 0
@@ -232,6 +254,23 @@ function Start-ShareSession {
             Process = $process
             Listener = $listener
             CompanionActive = $companionActive
+        }
+
+        if ($mode -eq 'app') {
+            $startedApp = $true
+            $session = $script:sessions[$mode]
+            $timer = [Diagnostics.Stopwatch]::StartNew()
+            while ($timer.ElapsedMilliseconds -lt 6000 -and -not $process.HasExited -and $null -eq $session.DisplayId) {
+                Update-ShareProcessLog $session
+                if ($null -eq $session.DisplayId) { Start-Sleep -Milliseconds 100 }
+            }
+            if ($process.HasExited -or $null -eq $session.DisplayId) { throw (Get-Text 'appDisplayMissing') }
+            # A successful start message does not prove where Android placed the task.
+            # Confirm against the activity list without launching on display 0.
+            $dump = Invoke-DiscoveryAdb @('-s', ([AndroidScreenShare.CapturedProcess]::Quote($serial)), 'shell', 'dumpsys', 'activity', 'activities') 2500
+            if (Test-AppOnDisplay $dump $session.DisplayId $appPackage) {
+                Add-Log (Get-Text 'appOnDisplay' @($appPackage, $session.DisplayId))
+            } else { Add-Log (Get-Text 'appPlacementUnconfirmed' @($appPackage)) }
         }
 
         if ($mode -eq 'desktop') {
@@ -264,6 +303,7 @@ function Start-ShareSession {
         }
         Add-Log (Get-Text 'diagnosticEnabled')
     } catch {
+        if ($startedApp) { Stop-ShareSession 'app' }
         Add-Log (Get-Text 'startFailed' @($_.Exception.Message))
         [System.Windows.Forms.MessageBox]::Show(
             $_.Exception.Message,

@@ -4,6 +4,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -Path (Join-Path $PSScriptRoot '..\app\DesktopIntegration.cs') -ReferencedAssemblies @(
     'System.dll', 'System.Core.dll', 'System.Windows.Forms.dll', 'System.Drawing.dll')
 . (Join-Path $PSScriptRoot '..\app\PlaybackControls.ps1')
+. (Join-Path $PSScriptRoot '..\app\IndependentApps.ps1')
 function Assert($condition, [string]$message) { if (-not $condition) { throw $message } }
 function Get-Text([string]$key, [object[]]$values) { $key }
 
@@ -42,11 +43,39 @@ $blocked=$false
 try { Get-ControlSession | Out-Null } catch { $blocked=$true }
 Assert $blocked 'Missing selected session silently targeted another session'
 
+$script:modeCombo.SelectedIndex=2
+$session.Mode='app'; $session.DisplayId=11; $session.Sdk=31
+$script:sessions.app=$session
+Assert ((Get-ControlSession).DisplayId -eq 11) 'App controls did not select their own display'
+Assert (((Get-GestureArguments $session 'next') -join ' ') -match '-d 11 swipe') 'App gesture did not target the app display'
+$session.InputWidth = 1440; $session.InputHeight = 2560
+$arguments = Get-GestureArguments $session 'next'
+Assert (($arguments -join ' ') -eq '-s DESKTOP_DEVICE shell input -d 11 swipe 1280 1080 1280 360 300') 'App swipe kept portrait coordinates after the video rotated'
+$session.DisplayId=0
+$blocked=$false
+try { Get-GestureArguments $session 'next' | Out-Null } catch { $blocked=$true }
+Assert $blocked 'App gesture incorrectly accepted display zero'
+
+$portrait=Get-IndependentAppDisplay '1080p' $false
+$landscape=Get-IndependentAppDisplay '1440p' $true
+Assert ($portrait.Spec -eq '1080x1920/320' -and $landscape.Spec -eq '2560x1440/420') 'App window orientation or resolution was lost'
+$apps=@(ConvertFrom-ScrcpyAppList @(' [server] INFO: List of apps:', ' - Example App    org.example.player', ' * Settings     com.android.settings', ' - Example App    org.example.player'))
+Assert ($apps.Count -eq 2 -and $apps.Package -contains 'org.example.player') 'Launchable apps were not extracted or deduplicated'
+Assert (-not (Test-AndroidAppPackage '+org.example.player')) 'App package permitted a force-stop prefix'
+Assert ((Get-ScrcpyCreatedDisplayId '[server] INFO: New display: 1080x1920/320 (id=11)') -eq 11) 'New display id was not identified from its own process'
+$appDump="Display #0 (activities from top to bottom):`n  mResumedActivity: ActivityRecord{a u0 org.example.player/.Main t1}`nDisplay #11 (activities from top to bottom):`n  mResumedActivity: ActivityRecord{b u0 com.android.settings/.Settings t2}"
+Assert (-not (Test-AppOnDisplay $appDump 11 'org.example.player')) 'An app on the phone was mistaken for an app on the virtual screen'
+Assert (Test-AppOnDisplay $appDump 11 'com.android.settings') 'App on the virtual display was not detected'
+
 $dump = 'DisplayInfo{"phone", displayId 0, real 1080 x 2400, rotation 0}' + "`n" +
     'DisplayInfo{"scrcpy", displayId 7, real 2560 x 1440, rotation 0}'
 $size = Get-DisplayInputSize $dump 7
 Assert ($size.Width -eq 2560 -and $size.Height -eq 1440) 'Display dimensions came from another display'
 Assert ($null -eq (Get-DisplayInputSize $dump 3)) 'Missing display returned unrelated dimensions'
+$rotatedDump = 'mBaseDisplayInfo=DisplayInfo{"scrcpy", displayId 11, real 1440 x 2560, rotation 0}' + "`n" +
+    'mOverrideDisplayInfo=DisplayInfo{"scrcpy", displayId 11, real 2560 x 1440, rotation 1}'
+$size = Get-DisplayInputSize $rotatedDump 11
+Assert ($size.Width -eq 2560 -and $size.Height -eq 1440) 'Display lookup ignored the rotation override'
 
 # Restore on the cursor monitor and clamp layouts after a monitor is unplugged.
 $script:rememberWindowCheck=[pscustomobject]@{Checked=$true}
@@ -74,4 +103,4 @@ try {
     Assert (($script:capturedLogs -join '|') -match 'test decoder message') 'stderr diagnostics were lost'
     Assert ([AndroidScreenShare.CapturedProcess]::Quote('C:\with spaces\') -eq '"C:\with spaces\\"') 'Trailing-backslash argument escaping failed'
 } finally { $capture.Dispose() }
-Write-Output 'PASS: presets, display-specific swipes, rotation, legacy Android, session routing, layout recovery, real FPS and stderr capture'
+Write-Output 'PASS: presets, display-specific swipes, app enumeration and placement, rotation, legacy Android, session routing, layout recovery, real FPS and stderr capture'
