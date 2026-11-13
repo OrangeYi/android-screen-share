@@ -30,17 +30,37 @@ function Test-WirelessEndpoint([string]$Endpoint) {
         [int]$Matches[2] -gt 0 -and [int]$Matches[2] -le 65535)
 }
 
-function Get-DiscoveryDevices {
-    $output = Invoke-DiscoveryAdb @('devices', '-l')
-    foreach ($line in ($output -split "`r?`n")) {
+function ConvertFrom-AdbDeviceList([string[]]$Lines) {
+    foreach ($line in $Lines) {
         if ($line -match '^(\S+)\s+device(?:\s+(.*))?$') {
             $serial = $Matches[1]
             $details = $Matches[2]
-            $identity = Invoke-DiscoveryAdb @('-s', $serial, 'shell', 'getprop', 'ro.serialno') 1500
-            if ($identity -match '\s|error:|unknown' -or -not $identity) { $identity = $serial }
-            [pscustomobject]@{ Serial = $serial; Details = $details; Identity = $identity }
+            [pscustomobject]@{
+                Serial = $serial
+                Details = $details
+                IsUsb = $serial -notmatch ':|\._adb|^emulator-'
+            }
         }
     }
+}
+
+function Get-AdbDeviceIdentity([string]$Serial) {
+    $identity = Invoke-DiscoveryAdb @('-s', $Serial, 'shell', 'getprop', 'ro.serialno') 1500
+    if ($identity -and $identity -notmatch '\s|error:|^unknown$') { return $identity }
+}
+
+function Get-DiscoveryDevices {
+    $output = Invoke-DiscoveryAdb @('devices', '-l')
+    foreach ($device in (ConvertFrom-AdbDeviceList ($output -split '\r?\n'))) {
+        $identity = Get-AdbDeviceIdentity $device.Serial
+        if (-not $identity) { $identity = $device.Serial }
+        $device | Add-Member NoteProperty Identity $identity -PassThru
+    }
+}
+
+function Select-PreferredAdbDevice($Devices, [string]$PreferredSerial) {
+    $Devices | Sort-Object @{Expression={ -not $_.IsUsb }}, @{Expression={ $_.Serial -ne $PreferredSerial }} |
+        Select-Object -First 1
 }
 
 function Test-DiscoveryTarget($Devices, [string]$Serial, [string]$Identity) {

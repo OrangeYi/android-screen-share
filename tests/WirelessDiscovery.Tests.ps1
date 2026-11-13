@@ -14,6 +14,17 @@ Assert (-not (Test-WirelessEndpoint '192.168.50.8:65536')) 'Invalid port accepte
 Assert (-not (Test-DiscoveryTarget @() 'old' 'TEST_DEVICE')) 'Empty device list matched'
 Assert (Test-DiscoveryTarget @((Get-TestDevice '192.168.50.9:41234')) 'old-address' 'TEST_DEVICE') 'Stable identity did not survive address change'
 
+$transports = @(ConvertFrom-AdbDeviceList @(
+    'adb-test._adb-tls-connect._tcp device model:Test',
+    '192.168.50.8:5555 device model:Test',
+    'test-usb unauthorized usb:1-2',
+    'test-usb-2 offline usb:1-3',
+    'test-usb-3 device model:Test',
+    'emulator-5554 device model:Test'
+))
+Assert ($transports.Count -eq 4) 'Offline or unauthorized devices were treated as usable'
+Assert (@($transports | Where-Object IsUsb).Count -eq 1) 'Non-USB transport was classified as USB'
+
 # Fast path must never search when the selected physical device is online.
 function Get-DiscoveryDevices { Get-TestDevice }
 function Find-OpenWirelessEndpoints { throw 'Unexpected port scan on fast path' }

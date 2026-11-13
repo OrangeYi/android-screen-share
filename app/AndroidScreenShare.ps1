@@ -58,6 +58,9 @@ $script:spacePlaybackHook = $null
 $script:spacePlaybackCheck = $null
 $script:playbackWorker = $null
 $script:playbackInvocation = $null
+$script:usbPoll = $null
+$script:usbPollAt = [DateTime]::MinValue
+$script:usbDeviceIdentities = @{}
 
 function Get-Text([string]$key, [object[]]$values = @()) {
     $value = [string]$script:T.$key
@@ -137,18 +140,16 @@ function Refresh-Devices([switch]$ListOnly, [switch]$ForceSearch) {
             @(Find-WirelessDevices $previous $script:lastDeviceIdentity $script:addressBox.Text.Trim() -ForceSearch:$ForceSearch)
         }
         $items = @()
-        # A wireless device may appear under both its mDNS name and IP endpoint.
+        # A phone can have USB, mDNS and IP connections at the same time.
         foreach ($group in @($devices | Group-Object Identity)) {
-            $device = $group.Group | Sort-Object @{Expression={
-                if ($_.Serial -eq $previous) {0} elseif ($_.Serial -match ':|_adb') {1} else {2}
-            }} | Select-Object -First 1
+            $device = Select-PreferredAdbDevice $group.Group $previous
             $serial = $device.Serial
             $details = $device.Details
             $model = Get-Text 'androidDevice'
             if ($details -match '\bmodel:(\S+)') {
                 $model = $Matches[1].Replace('_', ' ')
             }
-            $transport = if ($serial -match ':|_adb') { Get-Text 'wifi' } else { Get-Text 'usb' }
+            $transport = if ($device.IsUsb) { Get-Text 'usb' } else { Get-Text 'wifi' }
             $items += [pscustomobject]@{
                 Serial = $serial
                 Identity = $device.Identity
@@ -822,6 +823,8 @@ $pollTimer.Add_Tick({
             }
         }
     }
+    try { Update-ShareUsbConnections }
+    catch { Add-Log (Get-Text 'usbPollFailed' @($_.Exception.Message)) }
 })
 
 $form.Add_Shown({
@@ -840,6 +843,7 @@ $form.Add_Shown({
 
 $form.Add_FormClosing({
     $pollTimer.Stop()
+    if ($script:usbPoll) { $script:usbPoll.Dispose() }
     Stop-IndependentAppList
     Stop-HongguoSpaceShortcut
     $script:hotkeys.Dispose()

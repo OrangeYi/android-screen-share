@@ -78,7 +78,7 @@ function Get-VirtualDisplayIds([string]$serial) {
     return @($ids | Sort-Object -Unique)
 }
 
-function Stop-ShareSession([string]$mode, [bool]$killProcess = $true) {
+function Stop-ShareSession([string]$mode, [bool]$killProcess = $true, [switch]$graceful) {
     if (-not $script:sessions.ContainsKey($mode)) { return }
     $session = $script:sessions[$mode]
     Save-SessionWindow $session
@@ -88,14 +88,22 @@ function Stop-ShareSession([string]$mode, [bool]$killProcess = $true) {
     if ($session.GestureProcess) { $session.GestureProcess.Dispose() }
 
     if ($killProcess -and -not $session.Process.HasExited) {
-        Stop-Process -Id $session.Process.Id -Force -ErrorAction SilentlyContinue
+        if (-not ($graceful -and $session.Process.CloseMainWindow() -and $session.Process.WaitForExit(1500))) {
+            Stop-Process -Id $session.Process.Id -Force -ErrorAction SilentlyContinue
+        }
     }
     if ($session.CompanionActive) {
         try { $session.Listener.Stop() } catch {}
-        Invoke-Adb $session.Serial @(
-            'shell', '--', 'am', 'stopservice', '-n', $session.Component) -allowFailure | Out-Null
-        Invoke-Adb $session.Serial @(
-            'reverse', '--remove', "tcp:$($session.Port)") -allowFailure | Out-Null
+        $stopService = @('shell', '--', 'am', 'stopservice', '-n', $session.Component)
+        $removeReverse = @('reverse', '--remove', "tcp:$($session.Port)")
+        if ($graceful) {
+            $device = @('-s', [AndroidScreenShare.CapturedProcess]::Quote($session.Serial))
+            Invoke-DiscoveryAdb ($device + $stopService) 1200 | Out-Null
+            Invoke-DiscoveryAdb ($device + $removeReverse) 1200 | Out-Null
+        } else {
+            Invoke-Adb $session.Serial $stopService -allowFailure | Out-Null
+            Invoke-Adb $session.Serial $removeReverse -allowFailure | Out-Null
+        }
     }
     $session.Capture.Dispose()
     Update-ShareHotkeys
@@ -104,14 +112,11 @@ function Stop-ShareSession([string]$mode, [bool]$killProcess = $true) {
 }
 
 function Start-ShareSession {
-    $startedApp = $false
     try {
         if (-not (Test-Path -LiteralPath $script:scrcpyPath)) {
             throw (Get-Text 'scrcpyMissing')
         }
 
-        $serial = Get-SelectedSerial
-        Save-Settings
         $mode = Get-SelectedShareMode
         if ($script:sessions.ContainsKey($mode)) {
             Add-Log (Get-Text 'alreadyRunning' @($mode))
@@ -122,6 +127,13 @@ function Start-ShareSession {
             ($mode -eq 'desktop' -and $script:sessions.ContainsKey('app'))) {
             throw (Get-Text 'appDesktopConflict')
         }
+
+        $preferredSerial = Get-SelectedSerial
+        $identity = [string]$script:deviceCombo.SelectedItem.Identity
+        $device = Select-PreferredAdbDevice @(Get-DiscoveryDevices | Where-Object Identity -ceq $identity) $preferredSerial
+        if (-not $device) { throw (Get-Text 'shareDeviceOffline') }
+        $serial = $device.Serial
+        Save-Settings
 
         $appPackage = ''
         $appDisplay = $null
@@ -139,11 +151,6 @@ function Start-ShareSession {
         $preset = Get-PlaybackPreset (@('control', 'movie', 'custom')[$script:presetCombo.SelectedIndex])
         $videoBuffer = [int]$script:bufferInput.Value
         $audioBuffer = [Math]::Max($preset.Audio, $videoBuffer)
-        $beforeIds = @()
-        if ($mode -eq 'desktop') {
-            $beforeIds = @(Get-VirtualDisplayIds $serial)
-        }
-
         $scrcpyArguments = @(
             '-s', $serial,
             '--video-codec=h264',
@@ -194,20 +201,58 @@ function Start-ShareSession {
             $component = 'dev.androidscreenshare.companion/.MirrorShareService'
         }
 
+        $launch = @{
+            Mode = $mode
+            Identity = $identity
+            Arguments = [string[]]$scrcpyArguments
+            AppPackage = $appPackage
+            Fps = $fps
+            Bitrate = $bitrate
+            VideoBuffer = $videoBuffer
+            Mini = $script:miniCheck.Checked
+            Topmost = $script:topmostCheck.Checked
+            InputWidth = $(if ($appDisplay) { $appDisplay.Width } elseif ($mode -eq 'desktop') { if ($quality -eq '1440p') { 2560 } else { 1920 } } else { 0 })
+            InputHeight = $(if ($appDisplay) { $appDisplay.Height } elseif ($mode -eq 'desktop') { if ($quality -eq '1440p') { 1440 } else { 1080 } } else { 0 })
+            Port = $port
+            Component = $component
+            CompanionReady = $companionReady
+        }
+        Open-ShareSession $launch $serial $device.IsUsb
+    } catch {
+        Add-Log (Get-Text 'startFailed' @($_.Exception.Message))
+        [System.Windows.Forms.MessageBox]::Show(
+            $_.Exception.Message,
+            (Get-Text 'startFailedTitle'),
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    }
+}
+
+function Open-ShareSession([hashtable]$launch, [string]$serial, [bool]$isUsb) {
+    $mode = $launch.Mode
+    $port = $launch.Port
+    $component = $launch.Component
+    $appPackage = $launch.AppPackage
+    $beforeIds = @()
+    if ($mode -eq 'desktop') { $beforeIds = @(Get-VirtualDisplayIds $serial) }
+
+    $capture = $null
+    try {
+        $arguments = [string[]]$launch.Arguments.Clone()
+        $arguments[1] = $serial
         Add-Log (Get-Text 'starting' @($serial, $mode))
-        $capture = [AndroidScreenShare.CapturedProcess]::new($script:scrcpyPath, [string[]]$scrcpyArguments, $script:scrcpyDir)
+        $capture = [AndroidScreenShare.CapturedProcess]::new($script:scrcpyPath, $arguments, $script:scrcpyDir)
         $process = $capture.Process
         Start-Sleep -Milliseconds 900
         if ($process.HasExited) {
             $line = ''
             while ($capture.TryReadLine([ref]$line)) { Add-Log $line }
-            $capture.Dispose()
             throw (Get-Text 'startupExit')
         }
 
         $listener = $null
         $companionActive = $false
-        if ($companionReady) {
+        if ($launch.CompanionReady) {
             try {
                 $listener = [System.Net.Sockets.TcpListener]::new(
                     [System.Net.IPAddress]::Loopback,
@@ -230,16 +275,19 @@ function Start-ShareSession {
         $script:sessions[$mode] = [pscustomobject]@{
             Mode = $mode
             Serial = $serial
+            IsUsb = $isUsb
+            Launch = $launch
+            FailedUsb = ''
             AppPackage = $appPackage
-            Fps = $fps
-            Bitrate = $bitrate
+            Fps = $launch.Fps
+            Bitrate = $launch.Bitrate
             Diagnostics = (New-SessionDiagnostics)
             Capture = $capture
-            Mini = $script:miniCheck.Checked
-            Topmost = $script:topmostCheck.Checked
+            Mini = $launch.Mini
+            Topmost = $launch.Topmost
             DisplayId = $(if ($mode -eq 'mirror') { 0 } else { $null })
-            InputWidth = $(if ($appDisplay) { $appDisplay.Width } elseif ($mode -eq 'desktop') { if ($quality -eq '1440p') { 2560 } else { 1920 } } else { 0 })
-            InputHeight = $(if ($appDisplay) { $appDisplay.Height } elseif ($mode -eq 'desktop') { if ($quality -eq '1440p') { 1440 } else { 1080 } } else { 0 })
+            InputWidth = $launch.InputWidth
+            InputHeight = $launch.InputHeight
             Sdk = 0
             TextureWidth = 0
             TextureHeight = 0
@@ -257,7 +305,6 @@ function Start-ShareSession {
         }
 
         if ($mode -eq 'app') {
-            $startedApp = $true
             $session = $script:sessions[$mode]
             $timer = [Diagnostics.Stopwatch]::StartNew()
             while ($timer.ElapsedMilliseconds -lt 6000 -and -not $process.HasExited -and $null -eq $session.DisplayId) {
@@ -294,8 +341,9 @@ function Start-ShareSession {
 
         Initialize-SessionInput $script:sessions[$mode]
         Update-ShareProcessLog $script:sessions[$mode]
+        if ($process.HasExited) { throw (Get-Text 'startupExit') }
         Update-ShareHotkeys
-        Add-Log (Get-Text 'playbackStarted' @($videoBuffer, $script:miniCheck.Checked))
+        Add-Log (Get-Text 'playbackStarted' @($launch.VideoBuffer, $launch.Mini))
         if ($companionActive) {
             Add-Log (Get-Text 'sharingActiveWithCompanion' @($mode))
         } else {
@@ -303,12 +351,91 @@ function Start-ShareSession {
         }
         Add-Log (Get-Text 'diagnosticEnabled')
     } catch {
-        if ($startedApp) { Stop-ShareSession 'app' }
-        Add-Log (Get-Text 'startFailed' @($_.Exception.Message))
-        [System.Windows.Forms.MessageBox]::Show(
-            $_.Exception.Message,
-            (Get-Text 'startFailedTitle'),
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        if ($script:sessions.ContainsKey($mode)) { Stop-ShareSession $mode }
+        elseif ($capture) { $capture.Dispose() }
+        throw
     }
+}
+
+function Switch-ShareSessionToUsb([psobject]$session, [string]$usbSerial) {
+    $mode = $session.Mode
+    $launch = $session.Launch.Clone()
+    $launch.Mini = $session.Mini
+    $launch.Topmost = $session.Topmost
+    $window = [AndroidScreenShare.DesktopWindows]::Find($session.Process.Id)
+    $snapshot = [AndroidScreenShare.DesktopWindows]::Snapshot($window)
+    $launch.Arguments = @($launch.Arguments | Where-Object { $_ -ne '--always-on-top' })
+    if ($launch.Topmost -or $launch.Mini) { $launch.Arguments += '--always-on-top' }
+    if ($snapshot -and -not $snapshot.Minimized -and -not $snapshot.Maximized -and -not $snapshot.Fullscreen) {
+        $launch.Arguments = @($launch.Arguments | Where-Object { $_ -notmatch '^--window-(x|y|width|height)=' })
+        $launch.Arguments += @("--window-x=$($snapshot.X)", "--window-y=$($snapshot.Y)",
+            "--window-width=$($snapshot.Width)", "--window-height=$($snapshot.Height)")
+    }
+
+    Add-Log (Get-Text 'usbSwitchStarting' @($mode))
+    try {
+        Stop-ShareSession $mode -graceful
+        Open-ShareSession $launch $usbSerial $true
+        Add-Log (Get-Text 'usbSwitchCompleted' @($mode))
+    } catch {
+        Add-Log (Get-Text 'usbSwitchFailed' @($mode, $_.Exception.Message))
+        if ($script:sessions.ContainsKey($mode)) {
+            $session.FailedUsb = $usbSerial
+            return
+        }
+        try {
+            Open-ShareSession $launch $session.Serial $false
+            $script:sessions[$mode].FailedUsb = $usbSerial
+        } catch {
+            Add-Log (Get-Text 'startFailed' @($_.Exception.Message))
+        }
+        return
+    }
+    Refresh-Devices -ListOnly
+}
+
+function Update-ShareUsbConnections {
+    $wireless = @($script:sessions.Values | Where-Object { -not $_.IsUsb })
+    if ($script:usbPoll) {
+        $poll = $script:usbPoll
+        if (-not $poll.OutputComplete -or -not $poll.Process.HasExited) {
+            if (((Get-Date) - $script:usbPollAt).TotalSeconds -ge 3) {
+                $poll.Dispose()
+                $script:usbPoll = $null
+            }
+            return
+        }
+        $lines = @()
+        $line = ''
+        $exitCode = $poll.Process.ExitCode
+        while ($poll.TryReadLine([ref]$line)) { $lines += $line }
+        $poll.Dispose()
+        $script:usbPoll = $null
+        if ($exitCode -ne 0 -or -not $wireless.Count) { return }
+
+        $usbDevices = @(ConvertFrom-AdbDeviceList $lines | Where-Object IsUsb)
+        $usbSerials = @($usbDevices | ForEach-Object Serial)
+        foreach ($serial in @($script:usbDeviceIdentities.Keys)) {
+            if ($serial -cnotin $usbSerials) { $script:usbDeviceIdentities.Remove($serial) }
+        }
+        foreach ($device in $usbDevices) {
+            if (-not $script:usbDeviceIdentities.ContainsKey($device.Serial)) {
+                $identity = Get-AdbDeviceIdentity $device.Serial
+                if ($identity) { $script:usbDeviceIdentities[$device.Serial] = $identity }
+            }
+        }
+        foreach ($session in $wireless) {
+            if ($session.FailedUsb -cnotin $usbSerials) { $session.FailedUsb = '' }
+            $usb = $usbDevices | Where-Object {
+                $_.Serial -cne $session.FailedUsb -and
+                $script:usbDeviceIdentities[$_.Serial] -ceq $session.Launch.Identity
+            } | Select-Object -First 1
+            if ($usb) { Switch-ShareSessionToUsb $session $usb.Serial }
+        }
+        return
+    }
+    if (-not $wireless.Count) { $script:usbDeviceIdentities.Clear(); return }
+    if (((Get-Date) - $script:usbPollAt).TotalSeconds -lt 2) { return }
+    $script:usbPollAt = Get-Date
+    $script:usbPoll = [AndroidScreenShare.CapturedProcess]::new($script:adbPath, [string[]]@('devices','-l'), $script:scrcpyDir)
 }
