@@ -57,6 +57,7 @@ namespace AndroidScreenShare {
     }
     public static class DesktopWindows {
         [StructLayout(LayoutKind.Sequential)] private struct Rect { public int Left, Top, Right, Bottom; }
+        [StructLayout(LayoutKind.Sequential)] private struct Point { public int X, Y; }
         private delegate bool EnumProc(IntPtr handle, IntPtr data);
         [DllImport("user32.dll")] private static extern bool EnumWindows(EnumProc callback, IntPtr data);
         [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr handle, out uint process);
@@ -65,6 +66,10 @@ namespace AndroidScreenShare {
         [DllImport("user32.dll")] private static extern bool IsZoomed(IntPtr handle);
         [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr handle, out Rect rectangle);
         [DllImport("user32.dll")] private static extern bool GetClientRect(IntPtr handle, out Rect rectangle);
+        [DllImport("user32.dll")] private static extern bool ClientToScreen(IntPtr handle, ref Point point);
+        [DllImport("user32.dll")] private static extern IntPtr WindowFromPoint(Point point);
+        [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll")] private static extern int GetWindowLong(IntPtr handle, int index);
         [DllImport("user32.dll")] private static extern bool AdjustWindowRectEx(ref Rect rectangle, uint style, bool menu, uint extendedStyle);
         [DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr handle, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
@@ -96,11 +101,61 @@ namespace AndroidScreenShare {
         public static void SetTopmost(IntPtr handle, bool topmost) {
             SetWindowPos(handle, new IntPtr(topmost ? -1 : -2), 0, 0, 0, 0, 0x0010 | 0x0001 | 0x0002);
         }
+        public static bool WheelDown(int process) {
+            var window = GetForegroundWindow();
+            uint owner;
+            Rect client;
+            if (GetWindowThreadProcessId(window, out owner) == 0 || owner != (uint)process ||
+                !GetClientRect(window, out client) || client.Right < 100 || client.Bottom < 100) return false;
+            var center = new Point { X = client.Right / 2, Y = client.Bottom / 2 };
+            var screenPoint = center;
+            if (!ClientToScreen(window, ref screenPoint)) return false;
+            return PostMessage(window, 0x0200, IntPtr.Zero, PackPoint(center)) &&
+                   PostMessage(window, 0x020A, new IntPtr(-120 << 16), PackPoint(screenPoint));
+        }
+        private static IntPtr PackPoint(Point point) {
+            return new IntPtr(unchecked((point.Y << 16) | (point.X & 0xffff)));
+        }
+        public static System.Drawing.Bitmap CapturePlayerTop(int process, int videoWidth, int videoHeight) {
+            var window = GetForegroundWindow();
+            uint owner;
+            Rect client;
+            var origin = new Point();
+            if (GetWindowThreadProcessId(window, out owner) == 0 || owner != (uint)process ||
+                !GetClientRect(window, out client) || client.Right < 160 || client.Bottom < 160 ||
+                videoWidth <= 0 || videoHeight <= 0 ||
+                !ClientToScreen(window, ref origin)) return null;
+            double scale = Math.Min((double)client.Right / videoWidth, (double)client.Bottom / videoHeight);
+            int width = (int)(videoWidth * scale);
+            int height = (int)(videoHeight * scale);
+            var bounds = new System.Drawing.Rectangle(origin.X + (client.Right - width) / 2,
+                origin.Y + (client.Bottom - height) / 2, width, height / 3);
+            if (bounds.Width < 100 || bounds.Height < 60) return null;
+            if (!SystemInformation.VirtualScreen.Contains(bounds)) return null;
+            for (int y = 1; y <= 9; y += 4) {
+                for (int x = 1; x <= 9; x += 4) {
+                    if (WindowFromPoint(new Point { X = bounds.X + bounds.Width * x / 10,
+                        Y = bounds.Y + bounds.Height * y / 10 }) != window) return null;
+                }
+            }
+            var bitmap = new System.Drawing.Bitmap(bounds.Width, bounds.Height, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+            try {
+                using (var graphics = System.Drawing.Graphics.FromImage(bitmap)) {
+                    graphics.CopyFromScreen(bounds.Location, System.Drawing.Point.Empty, bounds.Size);
+                }
+                if (GetForegroundWindow() == window) return bitmap;
+                bitmap.Dispose();
+                return null;
+            } catch {
+                bitmap.Dispose();
+                throw;
+            }
+        }
     }
 
     public sealed class ShareHotkeys : NativeWindow, IDisposable {
-        internal const int SpaceMessage = 0x8035;
-        public event EventHandler SpacePressed;
+        internal const int PlayerKeyMessage = 0x8035;
+        public event EventHandler PlayerKeyPressed;
         [DllImport("user32.dll", SetLastError = true)] private static extern bool RegisterHotKey(IntPtr handle, int id, uint modifiers, uint key);
         [DllImport("user32.dll")] private static extern bool UnregisterHotKey(IntPtr handle, int id);
         private readonly ConcurrentQueue<string> commands = new ConcurrentQueue<string>();
@@ -121,8 +176,8 @@ namespace AndroidScreenShare {
         }
         public bool TryRead(out string command) { return commands.TryDequeue(out command); }
         protected override void WndProc(ref Message message) {
-            if (message.Msg == SpaceMessage) {
-                var handler = SpacePressed;
+            if (message.Msg == PlayerKeyMessage) {
+                var handler = PlayerKeyPressed;
                 if (handler != null) handler(this, EventArgs.Empty);
                 return;
             }
@@ -139,8 +194,8 @@ namespace AndroidScreenShare {
     }
 
     // Keep the keyboard hook off the GUI thread: an ADB call must never delay typing.
-    // Only Space in the exact, explicitly registered player process is intercepted.
-    public sealed class FocusedSpaceHotkey : IDisposable {
+    // Unmodified playback keys belong only to the selected player window.
+    public sealed class FocusedPlayerHotkeys : IDisposable {
         [StructLayout(LayoutKind.Sequential)] private struct NativeMessage {
             public IntPtr Window;
             public uint Message;
@@ -172,26 +227,38 @@ namespace AndroidScreenShare {
         private uint threadId;
         private IntPtr hook;
         private int pending;
-        private bool spaceDown;
+        private readonly bool enableSpace;
+        private readonly bool enableArrows;
+        private readonly HashSet<int> held = new HashSet<int>();
         public int TargetProcessId { get { return targetPid; } }
+        public bool SpaceEnabled { get { return enableSpace; } }
+        public bool ArrowsEnabled { get { return enableArrows; } }
 
-        public FocusedSpaceHotkey(int processId, IntPtr window) {
+        public FocusedPlayerHotkeys(int processId, IntPtr window, bool space, bool arrows) {
             if (processId <= 0) throw new ArgumentOutOfRangeException("processId");
             targetPid = processId;
             dispatchWindow = window;
+            enableSpace = space;
+            enableArrows = arrows;
             callback = OnKey;
             thread = new Thread(Run) { IsBackground = true };
             thread.Start();
             if (!ready.Wait(1500) || hook == IntPtr.Zero) {
                 Dispose();
-                throw new InvalidOperationException("Could not register the focused Space shortcut");
+                throw new InvalidOperationException("Could not register the focused playback shortcuts");
             }
         }
         public static bool HasFocus(int processId) {
             uint owner;
             return GetWindowThreadProcessId(GetForegroundWindow(), out owner) != 0 && owner == (uint)processId;
         }
-        public bool TakePress() { return Interlocked.Exchange(ref pending, 0) != 0 && HasFocus(targetPid); }
+        public string TakePress() {
+            int key = Interlocked.Exchange(ref pending, 0);
+            if (key == 0 || !HasFocus(targetPid)) return "";
+            if (key == 0x26) return "previous";
+            if (key == 0x28) return "next";
+            return "toggle";
+        }
         private void Run() {
             NativeMessage message;
             threadId = GetCurrentThreadId();
@@ -202,20 +269,20 @@ namespace AndroidScreenShare {
             finally { if (hook != IntPtr.Zero) UnhookWindowsHookEx(hook); }
         }
         private IntPtr OnKey(int code, IntPtr message, IntPtr data) {
-            if (!closed && code >= 0 && Marshal.ReadInt32(data) == 0x20) {
+            if (!closed && code >= 0) {
+                int key = Marshal.ReadInt32(data);
                 int type = message.ToInt32();
                 if (type == 0x101 || type == 0x105) {
-                    bool consumed = spaceDown;
-                    spaceDown = false;
-                    if (consumed && HasFocus(targetPid)) return new IntPtr(1);
-                } else if (type == 0x100 && HasFocus(targetPid) &&
+                    if (held.Remove(key) && HasFocus(targetPid)) return new IntPtr(1);
+                } else if (type == 0x100 &&
+                    ((key == 0x20 && enableSpace) || ((key == 0x26 || key == 0x28) && enableArrows)) &&
+                    HasFocus(targetPid) &&
                     !IsPressed(0x10) && !IsPressed(0x11) && !IsPressed(0x12) &&
                     !IsPressed(0x5B) && !IsPressed(0x5C)) {
-                    if (!spaceDown) {
-                        Interlocked.Exchange(ref pending, 1);
-                        PostMessage(dispatchWindow, ShareHotkeys.SpaceMessage, IntPtr.Zero, IntPtr.Zero);
+                    if (held.Add(key)) {
+                        Interlocked.Exchange(ref pending, key);
+                        PostMessage(dispatchWindow, ShareHotkeys.PlayerKeyMessage, IntPtr.Zero, IntPtr.Zero);
                     }
-                    spaceDown = true;
                     return new IntPtr(1);
                 }
             }

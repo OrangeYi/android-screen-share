@@ -297,6 +297,12 @@ function Open-ShareSession([hashtable]$launch, [string]$serial, [bool]$isUsb) {
             GestureProcess = $null
             GestureStarted = $null
             LastGesture = [DateTime]::MinValue
+            AdCountdown = 0
+            AdConfirmed = $false
+            AdMisses = 0
+            AdScrolls = 0
+            AdPage = ''
+            AdSwipedPage = ''
             Port = $port
             Component = $component
             Process = $process
