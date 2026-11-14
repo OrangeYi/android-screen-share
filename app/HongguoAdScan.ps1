@@ -86,22 +86,3 @@ function Read-HongguoAdBitmap([Drawing.Bitmap]$Bitmap, [switch]$KnownAd) {
 
 $script:ocrEngine = $null
 $script:ocrAsTask = $null
-
-function Get-HongguoAdObservation(
-    [string]$AdbPath, [string]$Serial, [int]$DisplayId, [int]$PlayerPid,
-    [int]$VideoWidth, [int]$VideoHeight
-) {
-    if (-not [AndroidScreenShare.FocusedPlayerHotkeys]::HasFocus($PlayerPid)) { return }
-    $card = $null
-    if ($DisplayId -gt 0) {
-        try {
-            $player = Join-Path $PSScriptRoot 'HongguoPlayback.ps1'
-            $card = & $player -AdbPath $AdbPath -Serial $Serial -DisplayId $DisplayId -PlayerPid $PlayerPid -CheckAdPage
-        } catch {
-            # Activity dumps can be unavailable while the player is changing screens.
-        }
-    }
-    $countdown = Get-HongguoAdCountdown $PlayerPid $VideoWidth $VideoHeight -KnownAd:([bool]$card)
-    if ($null -eq $countdown) { return }
-    return [pscustomobject]@{ Countdown=$countdown; AdPage=$(if ($card) { $card.Key } else { '' }) }
-}

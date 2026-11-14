@@ -4,9 +4,10 @@ param(
     [Parameter(Mandatory=$true)][ValidateRange(1,2147483647)][int]$DisplayId,
     [Parameter(Mandatory=$true)][ValidateRange(1,2147483647)][int]$PlayerPid,
     [switch]$RequireFocus,
-    [switch]$AlignAfterScroll,
-    [switch]$CheckAdPage,
-    [string]$SwipeAdPage
+    [switch]$NextEpisode,
+    [int]$VideoWidth,
+    [int]$VideoHeight,
+    [int[]]$NextSwipe
 )
 
 Set-StrictMode -Version 2.0
@@ -32,7 +33,10 @@ function Start-PlaybackAdb([string[]]$Arguments) {
 
 function Read-PlaybackAdb([hashtable]$command, [int]$timeoutMs) {
     $remaining = [Math]::Max(0, $timeoutMs - [int]$command.Clock.ElapsedMilliseconds)
-    if (-not $command.Process.WaitForExit($remaining)) { throw 'Android playback query timed out.' }
+    if (-not $command.Process.WaitForExit($remaining)) {
+        try { $command.Process.Kill() } catch { }
+        throw 'Android playback query timed out.'
+    }
     if ($command.Process.ExitCode -ne 0) { throw 'Android playback command failed.' }
     return ($command.Output.GetAwaiter().GetResult() + "`n" + $command.Error.GetAwaiter().GetResult())
 }
@@ -124,8 +128,9 @@ function Read-HongguoLayout([string]$dump, [psobject]$activity, [switch]$AllowOf
         }
         return
     }
-    $offsetLimit = if ($AllowOffset) { [int]([Math]::Min($width,$height) * 0.15) } else { 0 }
-    # The selected episode fills the viewport, with only a small offset after wheel scrolling.
+    # A wheel event can leave the next episode only half visible. Select it
+    # only when it occupies at least half the pager and is unambiguous.
+    $offsetLimit = if ($AllowOffset) { $height / 2 } else { 0 }
     $pages=@($nodes | Where-Object {
         $_.Page -eq $_.Key -and $_.Visible -and
         $_.X -eq 0 -and [Math]::Abs($_.Y) -le $offsetLimit -and $_.W -eq $width -and $_.H -eq $height
@@ -143,13 +148,20 @@ function Read-HongguoLayout([string]$dump, [psobject]$activity, [switch]$AllowOf
     }
 }
 
-function Get-PlayerCenter([psobject]$layout) {
-    $x = [int]($layout.Width / 2); $y = [int]($layout.Height / 2)
+function Test-PlayerPoint([psobject]$layout, [int]$x, [int]$y, [switch]$ForSwipe) {
     if (@($layout.Nodes | Where-Object {
         $_.Visible -and $_.Clickable -and $_.Id -ne 'dd' -and
+        # This full-page video touch layer is where the pager receives a drag.
+        (-not ($ForSwipe -and $_.Class -eq 'um4.b' -and $_.X -eq 0 -and
+            $_.Y -eq $layout.OffsetY -and $_.W -eq $layout.Width -and $_.H -eq $layout.Height)) -and
         $_.X -le $x -and ($_.X+$_.W) -gt $x -and
         $_.Y -le $y -and ($_.Y+$_.H) -gt $y
-    }).Count) { throw 'A different control occupies the center of the player.' }
+    }).Count) { throw 'A different control occupies the player input point.' }
+}
+
+function Get-PlayerCenter([psobject]$layout) {
+    $x = [int]($layout.Width / 2); $y = [int]($layout.Height / 2)
+    Test-PlayerPoint $layout $x $y
     return [pscustomobject]@{ X=$x; Y=$y }
 }
 
@@ -166,14 +178,182 @@ function Send-PlayerInput([string[]]$gesture, [int]$timeoutMs = 1800) {
 
 function Get-HongguoAlignmentSwipe([psobject]$layout) {
     if ([Math]::Abs($layout.OffsetY) -le 2) { return }
-    $center = Get-PlayerCenter $layout
+    $x = [int]($layout.Width / 2)
     $shortSide = [Math]::Min($layout.Width,$layout.Height)
-    # Move opposite the offset and allow for Android's initial touch slop.
-    # A slow release lets the pager settle on this episode.
-    $distance = [Math]::Abs($layout.OffsetY) + [int]($shortSide * 0.035)
-    $endY = $center.Y - [Math]::Sign($layout.OffsetY) * $distance
-    $duration = [int][Math]::Max(420, $distance * 1000 / ($shortSide * 0.07))
-    return @('swipe', [string]$center.X, [string]$center.Y, [string]$center.X, [string]$endY, [string]$duration)
+    # Start within the visible episode and keep both ends away from the
+    # edges. Move only the remaining distance, allowing for touch slop.
+    $distance = [Math]::Abs($layout.OffsetY) + [Math]::Max(12, [int]($shortSide * 0.022))
+    $direction = [Math]::Sign($layout.OffsetY)
+    $startY = [int]($layout.Height / 2 + $direction * ($distance / 2 - $layout.Height * 0.011))
+    $endY = $startY - $direction * $distance
+    Test-PlayerPoint $layout $x $startY -ForSwipe
+    $duration = [int]([Math]::Max(7, [Math]::Ceiling($distance * 20 / ($layout.Height * 0.63))) * 50)
+    return @('swipe', [string]$x, [string]$startY, [string]$x, [string]$endY, [string]$duration)
+}
+
+function Get-HongguoEpisodeForAlignment([psobject]$activity, [string]$dump) {
+    try { Read-HongguoLayout $dump $activity -AllowOffset }
+    catch { }
+}
+
+function Align-HongguoEpisode([psobject]$activity, [psobject]$layout, [switch]$AfterAd) {
+    if ($layout -and [Math]::Abs($layout.OffsetY) -le 2) { return }
+    $started = [Diagnostics.Stopwatch]::StartNew()
+    $previous = $layout
+    $target = if (-not $AfterAd) { $layout } else { $null }
+    $gestures = 0
+    $quickCheckMs = 75
+    $settleCheckMs = 220
+    $checkDelayMs = $quickCheckMs
+    for ($sample = 0; $sample -lt 9 -and $started.ElapsedMilliseconds -lt 4000; $sample++) {
+        Start-Sleep -Milliseconds $checkDelayMs
+        # Check promptly after the wheel or a drag. If that snapshot still
+        # shows movement or a partial layout, keep the normal settling delay.
+        $checkDelayMs = $settleCheckMs
+        $top = Start-PlaybackAdb @('dumpsys','activity',$activity.Record)
+        try {
+            $current = Read-HongguoLayout (Read-PlaybackAdb $top 900) $activity -AllowOffset
+        }
+        catch {
+            # A dump taken while the pager rebinds can be incomplete. Require
+            # two usable readings again before sending a drag.
+            $previous = $null
+            continue
+        }
+        if ($target -and ($current.Page -ne $target.Page -or $current.ProcessId -ne $target.ProcessId -or
+            $current.Width -ne $target.Width -or $current.Height -ne $target.Height)) {
+            $previous = $null
+            continue
+        }
+        if ([Math]::Abs($current.OffsetY) -le 2) { 'adScrollAligned'; return }
+        if ($previous -and $current.Page -eq $previous.Page -and $current.ProcessId -eq $previous.ProcessId -and
+            $current.Width -eq $previous.Width -and $current.Height -eq $previous.Height -and
+            $current.OffsetY -eq $previous.OffsetY -and $gestures -lt 2 -and $sample -lt 8) {
+            # Verify the activity on the exact display immediately before
+            # input. Avoid running two activity dumps at the same time.
+            $active = Start-PlaybackAdb @('dumpsys','activity','activities')
+            try { $resumed = Get-HongguoActivity (Read-PlaybackAdb $active 900) }
+            catch {
+                $previous = $null
+                continue
+            }
+            if ($resumed.Record -ne $activity.Record) { break }
+            $swipe = Get-HongguoAlignmentSwipe $current
+            Send-PlayerInput $swipe (1700 + [int]$swipe[-1])
+            $target = $current
+            $gestures++
+            $previous = $null
+            $checkDelayMs = $quickCheckMs
+            continue
+        }
+        $previous = $current
+    }
+    'adAlignIncomplete'
+}
+
+function Read-HongguoAfterAdInput([psobject]$activity) {
+    # Try again if the first view dump is unavailable while the ad moves.
+    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+        $top = Start-PlaybackAdb @('dumpsys','activity',$activity.Record)
+        try {
+            $dump = Read-PlaybackAdb $top 900
+            $card = Read-HongguoLayout $dump $activity -CheckAdPage
+            return @{ Dump=$dump; Ad=$card }
+        } catch { }
+    }
+}
+
+function Send-HongguoWheelDown {
+    [AndroidScreenShare.DesktopWindows]::WheelDown($PlayerPid)
+}
+
+function Invoke-HongguoAdWheel([psobject]$activity, [psobject]$card, [string]$logKey) {
+    for ($step = 0; $step -lt 8; $step++) {
+        if (-not (Send-HongguoWheelDown)) { return }
+        if ($step -eq 0) { $logKey }
+        Start-Sleep -Milliseconds 105
+
+        if ($activity) {
+            $view = Read-HongguoAfterAdInput $activity
+            if (-not $view) {
+                if ($card) { Align-HongguoEpisode $activity $null -AfterAd; return }
+                break
+            }
+            $visibleAd = $view.Ad
+            if ($visibleAd) {
+                if ($card -and $visibleAd.Key -cne $card.Key) { break }
+                $card = $visibleAd
+                continue
+            }
+            $layout = Get-HongguoEpisodeForAlignment $activity $view.Dump
+            if ($layout -or $card) {
+                Align-HongguoEpisode $activity $layout -AfterAd
+                return
+            }
+        }
+        if ($card) { break }
+        # A countdown may be recognized only by OCR on an unfamiliar ad.
+        try { $countdown = Get-HongguoAdCountdown $PlayerPid $VideoWidth $VideoHeight }
+        catch { break }
+        if ($countdown -le 0) { break }
+    }
+    'adWheelIncomplete'
+}
+
+function Invoke-HongguoNextEpisode {
+    if ($NextSwipe.Count -ne 5) { throw 'Next episode coordinates are unavailable.' }
+    $activity = $null
+    $card = $null
+    $layout = $null
+    try {
+        $activities = Start-PlaybackAdb @('dumpsys','activity','activities')
+        $activity = Get-HongguoActivity (Read-PlaybackAdb $activities 650)
+        $top = Start-PlaybackAdb @('dumpsys','activity',$activity.Record)
+        $dump = Read-PlaybackAdb $top 650
+        $card = Read-HongguoLayout $dump $activity -CheckAdPage
+        if (-not $card) { $layout = Get-HongguoEpisodeForAlignment $activity $dump }
+    } catch {
+        # The next-episode gesture also works in other Hongguo views.
+    }
+    if ($layout -and [Math]::Abs($layout.OffsetY) -gt 2) {
+        # A second press on a split page is a recovery, not another episode change.
+        Align-HongguoEpisode $activity $layout
+        return
+    }
+
+    $countdown = $null
+    if ($VideoWidth -gt 0 -and $VideoHeight -gt 0) {
+        try { $countdown = Get-HongguoAdCountdown $PlayerPid $VideoWidth $VideoHeight -KnownAd:([bool]$card) }
+        catch { }
+    }
+    if ($countdown -gt 0) {
+        Invoke-HongguoAdWheel $activity $card 'adScrollSent'
+        return
+    }
+
+    if (-not $card) {
+        Send-PlayerInput (@('swipe') + $NextSwipe)
+        'hongguoNextSent'
+        return
+    }
+
+    $x = [int]($card.Width * 0.5)
+    $start = [int]($card.Height * 0.75)
+    $end = [int]($card.Height * 0.25)
+    Send-PlayerInput @('swipe',$x,$start,$x,$end,'300')
+    Start-Sleep -Milliseconds 160
+    $view = Read-HongguoAfterAdInput $activity
+    if (-not $view) { Align-HongguoEpisode $activity $null -AfterAd; return }
+    $visibleAd = $view.Ad
+    if ($visibleAd) {
+        if ($visibleAd.Key -ceq $card.Key) {
+            Invoke-HongguoAdWheel $activity $visibleAd 'adWheelFallback'
+        }
+        return
+    }
+    $layout = Get-HongguoEpisodeForAlignment $activity $view.Dump
+    'adSwipeSent'
+    Align-HongguoEpisode $activity $layout -AfterAd
 }
 
 function Read-HongguoAudioState([hashtable]$command, [string]$appProcessId) {
@@ -187,44 +367,16 @@ function Read-HongguoAudioState([hashtable]$command, [string]$appProcessId) {
 
 $commands = [Collections.Generic.List[Diagnostics.Process]]::new()
 try {
+    if ($NextEpisode) {
+        . (Join-Path $PSScriptRoot 'HongguoAdScan.ps1')
+        Invoke-HongguoNextEpisode
+        return
+    }
     $activities = Start-PlaybackAdb @('dumpsys','activity','activities')
-    if (-not $AlignAfterScroll -and -not $CheckAdPage -and -not $SwipeAdPage) {
-        $audio = Start-PlaybackAdb @('dumpsys','audio')
-    }
-    $queryTimeout = if ($CheckAdPage) { 650 } else { 2200 }
-    $activity = Get-HongguoActivity (Read-PlaybackAdb $activities $queryTimeout)
+    $audio = Start-PlaybackAdb @('dumpsys','audio')
+    $activity = Get-HongguoActivity (Read-PlaybackAdb $activities 2200)
     $top = Start-PlaybackAdb @('dumpsys','activity',$activity.Record)
-    if ($CheckAdPage) { return Read-HongguoLayout (Read-PlaybackAdb $top $queryTimeout) $activity -CheckAdPage }
-    if ($SwipeAdPage) {
-        $card = Read-HongguoLayout (Read-PlaybackAdb $top 1800) $activity -CheckAdPage
-        if ($card -and $card.Key -ceq $SwipeAdPage) {
-            $x = [string][int]($card.Width * 0.5)
-            $start = [string][int]($card.Height * 0.75)
-            $end = [string][int]($card.Height * 0.25)
-            Send-PlayerInput @('swipe',$x,$start,$x,$end,'300')
-            return $true
-        }
-        return
-    }
-    $layout = Read-HongguoLayout (Read-PlaybackAdb $top 2800) $activity -AllowOffset:$AlignAfterScroll
-    if ($AlignAfterScroll) {
-        $swipe = Get-HongguoAlignmentSwipe $layout
-        if (-not $swipe) { return }
-        # The wheel animation may still be settling. Recheck the page and offset before dragging.
-        $active = Start-PlaybackAdb @('dumpsys','activity','activities')
-        $top = Start-PlaybackAdb @('dumpsys','activity',$activity.Record)
-        if ((Get-HongguoActivity (Read-PlaybackAdb $active 2200)).Record -ne $activity.Record) { return }
-        $current = Read-HongguoLayout (Read-PlaybackAdb $top 2800) $activity -AllowOffset
-        if ($current.Page -ne $layout.Page -or $current.OffsetY -ne $layout.OffsetY -or
-            $current.Width -ne $layout.Width -or $current.Height -ne $layout.Height) { return }
-        $checkedSwipe = Get-HongguoAlignmentSwipe $current
-        Send-PlayerInput $checkedSwipe (1700 + [int]$checkedSwipe[-1])
-        Start-Sleep -Milliseconds 350
-        $top = Start-PlaybackAdb @('dumpsys','activity',$activity.Record)
-        $aligned = Read-HongguoLayout (Read-PlaybackAdb $top 2800) $activity -AllowOffset
-        if ($aligned.Page -eq $layout.Page -and [Math]::Abs($aligned.OffsetY) -le 2) { return $true }
-        return
-    }
+    $layout = Read-HongguoLayout (Read-PlaybackAdb $top 2800) $activity
     $center = Get-PlayerCenter $layout
     $before = Read-HongguoAudioState $audio $layout.ProcessId
     Send-PlayerInput @('tap',[string]$center.X,[string]$center.Y)

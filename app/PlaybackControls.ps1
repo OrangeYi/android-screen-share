@@ -127,6 +127,7 @@ function Stop-HongguoShortcuts {
         $script:playbackWorker.Dispose()
         $script:playbackWorker = $null
         $script:playbackInvocation = $null
+        $script:playbackAction = ''
     }
 }
 
@@ -145,10 +146,8 @@ function Update-HongguoShortcuts {
     Stop-HongguoShortcuts
     if ($player) {
         try {
-            if ($space) {
-                $script:playbackWorker = [PowerShell]::Create()
-                $script:playbackWorker.Runspace.ThreadOptions = 'ReuseThread'
-            }
+            $script:playbackWorker = [PowerShell]::Create()
+            $script:playbackWorker.Runspace.ThreadOptions = 'ReuseThread'
             $script:playerHotkeys = [AndroidScreenShare.FocusedPlayerHotkeys]::new($player, $script:hotkeys.Handle, $space, $arrows)
         } catch {
             Stop-HongguoShortcuts
@@ -160,16 +159,19 @@ function Update-HongguoShortcuts {
 function Complete-HongguoPlayback {
     if (-not $script:playbackInvocation -or -not $script:playbackInvocation.IsCompleted) { return }
     try {
-        [void]$script:playbackWorker.EndInvoke($script:playbackInvocation)
-        Add-Log (Get-Text 'spacePlaybackSent')
+        $messages = $script:playbackWorker.EndInvoke($script:playbackInvocation)
+        if ($script:playbackAction -eq 'toggle') { Add-Log (Get-Text 'spacePlaybackSent') }
+        else { foreach ($key in $messages) { Add-Log (Get-Text ([string]$key)) } }
     } catch {
-        Add-Log (Get-Text 'spacePlaybackFailed' @($_.Exception.Message))
+        $key = if ($script:playbackAction -eq 'toggle') { 'spacePlaybackFailed' } else { 'hongguoNextFailed' }
+        Add-Log (Get-Text $key @($_.Exception.GetBaseException().Message))
     } finally {
         $script:playbackInvocation = $null
+        $script:playbackAction = ''
     }
 }
 
-function Send-HongguoPlaybackToggle {
+function Send-HongguoPlayback([string]$action) {
     if (-not $script:playbackWorker -or -not $script:sessions.ContainsKey('app')) { return }
     Complete-HongguoPlayback
     $session = $script:sessions.app
@@ -181,128 +183,25 @@ function Send-HongguoPlaybackToggle {
         $worker = Join-Path $script:root 'app\HongguoPlayback.ps1'
         $script:playbackWorker.Commands.Clear()
         $script:playbackWorker.Streams.ClearStreams()
-        [void]$script:playbackWorker.AddCommand($worker).AddParameters(@{
+        $parameters = @{
             AdbPath=$script:adbPath; Serial=$session.Serial; DisplayId=$session.DisplayId
             PlayerPid=$session.Process.Id; RequireFocus=$true
-        })
+        }
+        if ($action -eq 'next') {
+            Update-ShareProcessLog $session
+            $parameters.NextEpisode = $true
+            $parameters.VideoWidth = $session.TextureWidth
+            $parameters.VideoHeight = $session.TextureHeight
+            $parameters.NextSwipe = [int[]]((Get-GestureArguments $session 'next') | Select-Object -Last 5)
+        }
+        [void]$script:playbackWorker.AddCommand($worker).AddParameters($parameters)
+        $script:playbackAction = $action
         $script:playbackInvocation = $script:playbackWorker.BeginInvoke()
-    } catch { Add-Log (Get-Text 'spacePlaybackFailed' @($_.Exception.Message)) }
-}
-
-function Update-HongguoAdScroll {
-    $session = $script:sessions['app']
-    $eligible = $script:adScrollCheck.Checked -and $session -and $session.AppPackage -eq 'com.phoenix.read' -and
-        -not $session.Process.HasExited -and $session.TextureWidth -gt 0 -and $session.TextureHeight -gt 0 -and
-        [AndroidScreenShare.FocusedPlayerHotkeys]::HasFocus($session.Process.Id)
-    if ($session -and -not $eligible) {
-        $session.AdCountdown = 0
-        $session.AdConfirmed = $false
-        $session.AdMisses = 0
-        $session.AdScrolls = 0
-        $session.AdPage = ''
-        $session.AdSwipedPage = ''
-    }
-    if ($script:adScan) {
-        $scan = $script:adScan
-        if (-not $scan.Invocation.IsCompleted) { return }
-        $script:adScan = $null
-        try {
-            $result = $script:adScanner.EndInvoke($scan.Invocation)
-            if ($scan.Action) {
-                if ($result.Count -eq 1 -and $result[0] -eq $true -and
-                    [object]::ReferenceEquals($session, $scan.Session)) {
-                    if ($scan.Action -eq 'align') { Add-Log (Get-Text 'adScrollAligned') }
-                    else {
-                        $session.AdSwipedPage = $scan.Page
-                        $session.AdScrolls++
-                        Add-Log (Get-Text 'adSwipeSent')
-                    }
-                }
-                return
-            }
-            if (-not $eligible -or -not [object]::ReferenceEquals($session, $scan.Session) -or
-                ((Get-Date) - $script:adScanAt).TotalMilliseconds -gt 1500 -or
-                $session.LastGesture -gt $script:adScanAt -or $session.TextureWidth -ne $scan.Width -or
-                $session.TextureHeight -ne $scan.Height) { return }
-            if ($result.Count -ne 1) {
-                $session.AdMisses = 0
-                return
-            }
-            $observation = $result[0]
-            $countdown = [int]$observation.Countdown
-            if ($countdown -eq 0) {
-                if ($session.AdCountdown -gt 0 -or $session.AdPage -cne $observation.AdPage) { $session.AdMisses = 0 }
-                $session.AdPage = $observation.AdPage
-                $session.AdCountdown = 0
-                $session.AdConfirmed = $false
-                $session.AdMisses = [Math]::Min(2,$session.AdMisses + 1)
-                if ($session.AdMisses -lt 2 -or $session.DisplayId -le 0 -or
-                    $session.GestureProcess -or $script:playbackInvocation) { return }
-                if ($session.AdPage -and $session.AdPage -cne $session.AdSwipedPage) {
-                    Start-HongguoAdAction $session 'swipe'
-                    $session.AdMisses = 0
-                } elseif (-not $session.AdPage -and $session.AdScrolls -gt 0) {
-                    $session.AdScrolls = 0
-                    $session.AdSwipedPage = ''
-                    Start-HongguoAdAction $session 'align'
-                }
-                return
-            }
-            $session.AdPage = $observation.AdPage
-            if ($observation.AdPage) { $session.AdConfirmed = $true }
-            elseif ($countdown -gt $session.AdCountdown) { $session.AdConfirmed = $false }
-            elseif ($countdown -lt $session.AdCountdown) { $session.AdConfirmed = $true }
-            $session.AdCountdown = $countdown
-            $session.AdMisses = 0
-            if ($session.AdConfirmed -and $session.AdScrolls -lt 8 -and -not $script:playbackInvocation -and
-                -not $session.GestureProcess -and [AndroidScreenShare.DesktopWindows]::WheelDown($session.Process.Id)) {
-                if ($session.AdScrolls -eq 0) { Add-Log (Get-Text 'adScrollSent') }
-                $session.AdScrolls++
-            }
-        } catch {
-            if ($scan.Action) { return }
-            $script:adScrollCheck.Checked = $false
-            Add-Log (Get-Text 'adScrollFailed' @($_.Exception.GetBaseException().Message))
-        }
-        return
-    }
-    if (-not $eligible -or
-        ((Get-Date) - $script:adScanAt).TotalMilliseconds -lt 850) { return }
-    try {
-        if (-not $script:adScanner) {
-            $script:adScanner = [PowerShell]::Create()
-            $script:adScanner.Runspace.ThreadOptions = 'ReuseThread'
-            $path = Join-Path $script:root 'app\HongguoAdScan.ps1'
-            [void]$script:adScanner.AddScript('. $args[0]').AddArgument($path).Invoke()
-            if ($script:adScanner.HadErrors) { throw 'Could not load the ad detector.' }
-        }
-        $script:adScanAt = Get-Date
-        $script:adScanner.Commands.Clear()
-        [void]$script:adScanner.AddCommand('Get-HongguoAdObservation').AddParameters(@{
-            AdbPath=$script:adbPath; Serial=$session.Serial; DisplayId=$session.DisplayId
-            PlayerPid=$session.Process.Id; VideoWidth=$session.TextureWidth; VideoHeight=$session.TextureHeight
-        })
-        $script:adScan = @{
-            Invocation=$script:adScanner.BeginInvoke()
-            Session=$session; Width=$session.TextureWidth; Height=$session.TextureHeight; Action=''
-        }
     } catch {
-        $script:adScrollCheck.Checked = $false
-        Add-Log (Get-Text 'adScrollFailed' @($_.Exception.GetBaseException().Message))
+        $script:playbackAction = ''
+        $key = if ($action -eq 'toggle') { 'spacePlaybackFailed' } else { 'hongguoNextFailed' }
+        Add-Log (Get-Text $key @($_.Exception.GetBaseException().Message))
     }
-}
-
-function Start-HongguoAdAction([psobject]$session, [string]$action) {
-    $worker = Join-Path $script:root 'app\HongguoPlayback.ps1'
-    $parameters = @{
-        AdbPath=$script:adbPath; Serial=$session.Serial; DisplayId=$session.DisplayId
-        PlayerPid=$session.Process.Id; RequireFocus=$true
-    }
-    if ($action -eq 'align') { $parameters.AlignAfterScroll = $true }
-    else { $parameters.SwipeAdPage = $session.AdPage }
-    $script:adScanner.Commands.Clear()
-    [void]$script:adScanner.AddCommand($worker).AddParameters($parameters)
-    $script:adScan = @{ Invocation=$script:adScanner.BeginInvoke(); Session=$session; Action=$action; Page=$session.AdPage }
 }
 
 function Set-PlaybackPreset {

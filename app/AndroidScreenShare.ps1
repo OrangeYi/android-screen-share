@@ -58,9 +58,7 @@ $script:playerHotkeys = $null
 $script:spacePlaybackCheck = $null
 $script:playbackWorker = $null
 $script:playbackInvocation = $null
-$script:adScanner = $null
-$script:adScan = $null
-$script:adScanAt = [DateTime]::MinValue
+$script:playbackAction = ''
 $script:usbPoll = $null
 $script:usbPollAt = [DateTime]::MinValue
 $script:usbDeviceIdentities = @{}
@@ -334,7 +332,6 @@ function Load-Settings {
         if ('appLandscape' -in $propertyNames -and $settings.appLandscape -eq $true) { $script:appOrientationCombo.SelectedIndex = 1 }
         if ('appScreenOff' -in $propertyNames) { $script:appScreenOffCheck.Checked = $settings.appScreenOff -eq $true }
         if ('appSpacePlayback' -in $propertyNames) { $script:spacePlaybackCheck.Checked = $settings.appSpacePlayback -eq $true }
-        if ('appAdScroll' -in $propertyNames) { $script:adScrollCheck.Checked = $settings.appAdScroll -eq $true }
         if ('resolution' -in $propertyNames) { Set-ComboSelection $script:resolutionCombo ([string]$settings.resolution) }
         if ('fps' -in $propertyNames) { Set-ComboSelection $script:fpsCombo ([string]$settings.fps) }
         if ('bitrate' -in $propertyNames) { Set-ComboSelection $script:bitrateCombo ([string]$settings.bitrate) }
@@ -376,7 +373,6 @@ function Save-Settings {
             appLandscape = $script:appOrientationCombo.SelectedIndex -eq 1
             appScreenOff = [bool]$script:appScreenOffCheck.Checked
             appSpacePlayback = [bool]$script:spacePlaybackCheck.Checked
-            appAdScroll = [bool]$script:adScrollCheck.Checked
             resolution = [string]$script:resolutionCombo.SelectedItem
             fps = [string]$script:fpsCombo.SelectedItem
             bitrate = [string]$script:bitrateCombo.SelectedItem
@@ -743,13 +739,6 @@ $logDirectoryButton.Add_Click({
 })
 $playbackGroup.Controls.Add($logDirectoryButton)
 
-$script:adScrollCheck = New-Object System.Windows.Forms.CheckBox
-$script:adScrollCheck.Text = Get-Text 'appAdScroll'
-$script:adScrollCheck.Location = New-Object Drawing.Point(470, 141)
-$script:adScrollCheck.Size = New-Object Drawing.Size(220, 25)
-$script:adScrollCheck.Add_CheckedChanged({ Save-Settings })
-$playbackGroup.Controls.Add($script:adScrollCheck)
-
 $playbackGroup.Controls.Add((New-Label (Get-Text 'gestureHotkeys') 16 112 80))
 $script:hotkeyCombo = New-Object System.Windows.Forms.ComboBox
 $script:hotkeyCombo.Location = New-Object Drawing.Point(100, 108)
@@ -760,7 +749,7 @@ $script:hotkeyCombo.SelectedIndex = 0
 $script:hotkeyCombo.Add_SelectedIndexChanged({ if (-not $script:loadingSettings) { Update-ShareHotkeys; Save-Settings } })
 $playbackGroup.Controls.Add($script:hotkeyCombo)
 $playbackGroup.Controls.Add((New-Label (Get-Text 'gestureHotkeyHint') 320 112 365))
-$gestureHint = New-Label (Get-Text 'gestureHint') 16 145 450
+$gestureHint = New-Label (Get-Text 'gestureHint') 16 145 665
 $gestureHint.ForeColor = [Drawing.Color]::DimGray
 $playbackGroup.Controls.Add($gestureHint)
 
@@ -787,7 +776,7 @@ $script:hotkeys = New-Object AndroidScreenShare.ShareHotkeys
 $script:hotkeys.Add_PlayerKeyPressed({
     if (-not $script:playerHotkeys) { return }
     $action = $script:playerHotkeys.TakePress()
-    if ($action -eq 'toggle') { Send-HongguoPlaybackToggle }
+    if ($action -in @('toggle', 'next')) { Send-HongguoPlayback $action }
     elseif ($action -and $script:sessions.ContainsKey('app')) { Send-ShareGesture $action $script:sessions.app }
 })
 Update-IndependentAppControls
@@ -838,7 +827,6 @@ $pollTimer.Add_Tick({
             }
         }
     }
-    Update-HongguoAdScroll
     try { Update-ShareUsbConnections }
     catch { Add-Log (Get-Text 'usbPollFailed' @($_.Exception.Message)) }
 })
@@ -862,7 +850,6 @@ $form.Add_FormClosing({
     if ($script:usbPoll) { $script:usbPoll.Dispose() }
     Stop-IndependentAppList
     Stop-HongguoShortcuts
-    if ($script:adScanner) { $script:adScanner.Dispose() }
     $script:hotkeys.Dispose()
     $script:hotkeys = $null
     foreach ($session in @($script:sessions.Values)) { Save-SessionWindow $session }
