@@ -1,0 +1,48 @@
+name: Publish GitHub Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Validate version and extract release notes
+        shell: bash
+        run: |
+          version="$(tr -d '\r\n' < VERSION)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "The release tag must match VERSION." >&2
+            exit 1
+          fi
+
+          awk -v heading="## $version -" '
+            /^## / { if (found) exit; found = index($0, heading) == 1; next }
+            found { print; if ($0 ~ /[^[:space:]]/) has_notes = 1 }
+            END { if (!has_notes) exit 1 }
+          ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md" || {
+            echo "CHANGELOG.md needs a section with notes for $version." >&2
+            exit 1
+          }
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists for $GITHUB_REF_NAME."
+            exit 0
+          fi
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md"
